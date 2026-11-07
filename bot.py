@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 r"""Discord ⇄ Minecraft 橋接程式（單檔版）。
 
 原本拆在 bridge/ 套件裡的模組（config / jsonstore / textutil / mcws /
@@ -55,7 +55,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.4.0"
+__version__ = "9.4.1"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -484,6 +484,7 @@ class BridgeConfig:
 class PendingCommand:
     future: asyncio.Future
     timestamp: float
+    acked: bool = False        # 只收到橋接器的「已送出」ACK，還沒等到遊戲回顯
 
 
 class MCWebSocketServer:
@@ -522,6 +523,32 @@ class MCWebSocketServer:
     def game_clients(self) -> List[WebSocketServerProtocol]:
         """扣掉橋接器，剩下的才是遊戲本體那條連線。"""
         return [c for c in self._clients if c is not self._bridge_ws]
+
+    async def _subscribe_game_events(self, ws):
+        """向遊戲訂閱 PlayerMessage 等事件。
+
+        記憶體掃描抓聊天不穩定（尤其聊天格式改版後），而遊戲自己的 WebSocket
+        本來就支援 subscribe；兩條來源同時來的話由 5 秒去重擋掉重複。
+        """
+        await asyncio.sleep(1.5)
+        if ws not in self._clients or ws is self._bridge_ws:
+            return
+        for event in ("PlayerMessage", "PlayerJoin", "PlayerLeave"):
+            payload = {
+                "header": {
+                    "version": 1,
+                    "requestId": str(uuid.uuid4()),
+                    "messageType": "commandRequest",
+                    "messagePurpose": "subscribe",
+                },
+                "body": {"eventName": event},
+            }
+            try:
+                await ws.send(json.dumps(payload))
+            except Exception:
+                return
+            await asyncio.sleep(0.05)
+        log.info("📡 已向遊戲訂閱 PlayerMessage / PlayerJoin / PlayerLeave")
 
     # ------------------------------------------------ 生命週期
     async def start(self):
@@ -566,6 +593,9 @@ class MCWebSocketServer:
         self._connected.set()
         log.info(f"🟢 連線進入 {ws.remote_address}")
         await self._fire(self.on_connected)
+        # 遊戲端連上時主動訂閱聊天/加入事件（比掃記憶體可靠）；
+        # 延遲一下是為了先讓橋接器送 BridgeHello，別把訂閱發給橋接器
+        _spawn(self._subscribe_game_events(ws))
 
         try:
             async for raw in ws:
@@ -631,11 +661,25 @@ class MCWebSocketServer:
             log.error(f"事件處理錯誤 ({event}): {exc}")
 
     def _resolve_pending(self, req_id, body):
+        """收指令回應。
+
+        橋接器（MC-WS）收到 commandRequest 後會立刻回一則「sent」ACK，那不是
+        遊戲的真正回顯；以前把第一個回應就當答案，於是 /check、/players 全部顯示
+        `sent`。這裡把 ACK 只當「已送出」，繼續等遊戲自己那則回應。
+        """
         if not req_id:
             return
-        pending = self._pending.pop(req_id, None)
-        if pending and not pending.future.done():
-            pending.future.set_result(str(body.get("statusMessage") or "指令已送出"))
+        pending = self._pending.get(req_id)
+        if not pending or pending.future.done():
+            return
+
+        text = str(body.get("statusMessage") or body.get("output") or "").strip()
+        if text.lower() in ("sent", "empty command"):
+            pending.acked = True
+            return
+
+        self._pending.pop(req_id, None)
+        pending.future.set_result(text or "（遊戲沒有回顯示任何內容）")
 
     @staticmethod
     def _dedup_key(event: str, body: dict) -> str:
@@ -803,7 +847,8 @@ class MCWebSocketServer:
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            return "⚠️ 指令逾時"
+            # 只收到橋接器的 ACK（遊戲端沒回顯 / 沒連線）
+            return "（已送出，但遊戲沒有回顯示內容）" if self._pending.get(req_id) and self._pending[req_id].acked else "⚠️ 指令逾時"
         except Exception:
             return None
         finally:
@@ -1971,17 +2016,20 @@ class DCListener(discord.Client):
         await interaction.response.defer(thinking=True)
         names: List[str] = []
         source = ""
+        # 先問遊戲 `list`；拿不到有效回顯就退回事件快取（加入/離開事件累積的名單）
         if self.mc.game_clients():
-            raw = self._clean_result(await self.mc.send_command("list", timeout=8))
+            raw = self._clean_result(await self.mc.send_command("list", timeout=6))
             names = extract_players(raw)
-            source = "遊戲回報"
+            if names:
+                source = "遊戲回報（list）"
         if not names:
             names = sorted(self.mc.players)
-            source = "橋接事件快取"
+            if names:
+                source = "事件快取（PlayerJoin / PlayerLeave）"
 
         embed = discord.Embed(title=f"👥 線上玩家（{len(names)}）", color=0x3B82F6)
-        embed.description = _clip("、".join(names), 1900) if names else "📋 目前沒有玩家在線"
-        if source and names:
+        embed.description = _clip("、".join(names), 1900) if names else "📋 目前沒有偵測到玩家在線"
+        if source:
             embed.set_footer(text=f"來源：{source}")
         await interaction.followup.send(embed=embed)
 
@@ -2147,8 +2195,8 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="sync", description="重新同步斜線指令（改版後用）")
     async def slash_sync(self, interaction: discord.Interaction):
-        if not self._is_guild_admin(interaction):
-            return await self._deny(interaction, "❌ 需要管理員權限")
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
 
         await interaction.response.defer(ephemeral=True)
         self._synced_guilds.clear()
@@ -2157,8 +2205,8 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="shutdown", description="關閉 bot（斜線指令會一併消失）")
     async def slash_shutdown(self, interaction: discord.Interaction):
-        if not self._is_guild_admin(interaction):
-            return await self._deny(interaction, "❌ 需要管理員權限")
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
 
         await interaction.response.send_message(
             "🛑 **正在關閉**\n會先移除斜線指令再下線；下次要上線請跑 `start.bat`。",
@@ -2176,8 +2224,8 @@ class DCListener(discord.Client):
     ])
     async def slash_wl(self, interaction: discord.Interaction,
                        action: app_commands.Choice[str], user: Optional[str] = None):
-        if not self._is_guild_admin(interaction):
-            return await self._deny(interaction, "❌ 需要管理員權限")
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
 
         if action.value == "list":
             users = self.whitelist.users
@@ -2491,11 +2539,13 @@ class DCListener(discord.Client):
 
     @staticmethod
     def _clean_result(value: Any) -> str:
-        """把逾時 / 例外統一成空字串，避免把「⚠️ 指令逾時」當成真的回覆顯示。"""
+        """把逾時 / 例外 / 「只有 ACK」統一成空字串，避免被當成真的回覆顯示。"""
         if value is None or isinstance(value, BaseException):
             return ""
         text = str(value).strip()
-        return "" if text.startswith("⚠️") else text
+        if text.startswith("⚠️") or text.startswith("（"):
+            return ""
+        return text
 
     async def _cmd_mccommand(self, message: discord.Message):
         if not self._authorized(message.author):
