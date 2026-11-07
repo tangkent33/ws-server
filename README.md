@@ -5,7 +5,7 @@
 | --- | --- |
 | `MC-WS.exe` | 建立 `\\.\pipe\mc_chat_827`、把 DLL 注入 `Minecraft.Windows.exe`、把事件轉成 WebSocket 送到 `127.0.0.1:8000` |
 | `827dll.dll` | 注入到遊戲內的擷取 DLL（掃描記憶體，抓聊天 / 加入 / 離開 / 死亡 / TP / 封禁） |
-| `bot.py` | Discord Bot（單檔 v9.1，已把原本 `bridge/` 套件全部合併進來），接收事件並轉發到頻道 / Webhook |
+| `bot.py` | Discord Bot（單檔 v9.3，已把原本 `bridge/` 套件全部合併進來），接收事件並轉發到頻道 / Webhook |
 | `start.bat` | 一鍵啟動上面兩個 |
 | `old_bridge_20261107/` | 合併前的 `bridge/` 套件備份（程式已不再引用，確認沒問題後可刪） |
 | `bot_v1_backup.py` | 更早的單檔版本備份 |
@@ -28,12 +28,45 @@
 | `PlayerBan` | `玩家xuid … 已被封禁` | 🔨 封禁事件 |
 | `TP_DETECT` | `tpmultiplayer.xyz` 等 | 🛑 TP 平台特徵 |
 | `TP_JOIN` | `玩家嘗試加入 => 名稱:xxx PFID:…` / `try connect: xxx` | 🛑 偵測到 TP 拉人 → **自動踢出** |
-| `KickResult` | DLL 鍵盤注入的執行結果 | 失敗才寫 Discord |
+| `KickResult` | 指令執行結果回報 | 失敗才寫 Discord |
 | `BridgeStatus` | DLL 心跳 | 只寫 console（debug 等級） |
 
+## 斜線指令
+
+指令是以**伺服器（guild）指令**方式註冊，`/sync` 可強制重同步；簽名不符時會自動重同步一次。
+
+| 指令 | 說明 |
+| --- | --- |
+| `/status` | 橋接狀態、玩家數、待送指令數 |
+| `/ping` | 測試機器人是否在線 |
+| `/players` | 線上玩家（先問遊戲 `list`，失敗才用事件快取） |
+| `/check` | 時間 / 天氣 / 種子 |
+| `/cmd <指令>` | 在遊戲內執行 Minecraft 指令（有禁用清單） |
+| `/kick <玩家> [理由]` | 踢人（不封禁） |
+| `/ban <玩家> [分鐘] [理由]` | 寫入封禁名單並踢出 |
+| `/unban <玩家>` / `/banned` | 解封 / 查看名單 |
+| `/join <房間>` | 加入房間（快捷，等同 `/lianji join`） |
+| `/lianji list [語言]` | 房間列表（分頁 + 重新整理） |
+| `/lianji info <房間>` | 房間詳情 + 成員名單（標出遊戲內是否也偵測到） |
+| `/lianji join <房間>` | 加入房間 |
+| `/lianji me` | 查自己的 XUID / addid / 中繼帳號 |
+| `/lianji refresh` | 刷新後端粉絲快取 |
+| `/settings` `/sync` `/wl` | 設定 / 重同步指令 / 白名單 |
+
+`<房間>`、`<玩家>` 都支援**自動補全**（打幾個字就會列出房間或線上玩家）。
+
+## 指令佇列（v9.3 起）
+
+遊戲 WebSocket 沒連線時，踢人 / `/cmd` **不再退回鍵盤注入**，而是排進佇列，
+等遊戲連上後由背景 worker 自動補送並在 Discord 回報：
+
+- 佇列上限 `KICK_QUEUE_MAX`（預設 50），滿了直接丟棄並提示
+- 放超過 `KICK_QUEUE_TTL`（預設 600 秒）就作廢，避免幾小時後突然踢人
+- 想立刻生效：確認遊戲端 WebSocket 已連上（`/status` 看「遊戲 WebSocket」是否 🟢）
+
 ## 已知限制
-- **單向**：`ONE_WAY_MODE=true`，不會把 Discord 訊息 / 指令送回遊戲。
-  要雙向必須讓 DLL 模擬鍵盤輸入（遊戲需在前景），目前刻意不做。
+- Discord → 遊戲的訊息 / 指令走**遊戲端 WebSocket**（`/connect ws://127.0.0.1:8000`）。
+  沒連上時指令會排隊（見上節），不會用鍵盤模擬硬塞。
 - 聊天（`<名字> 訊息`）是靠記憶體特徵比對，少數訊息可能漏抓或誤判；
   加入 / 離開 / 封禁 / TP 是關鍵字錨定，穩定得多。
 - v9.1 起聊天會先驗「原始位元組是合法 UTF-8」再用共用的「像人打的字」閘門過濾，
@@ -43,11 +76,19 @@
 
 ## .env 可調
 ```
-ONE_WAY_MODE=true          # false 才會嘗試送指令回遊戲（目前不會成功）
+ONE_WAY_MODE=false         # false = 雙向（Discord 聊天也送進遊戲）
 ENABLE_JOIN_LEAVE=true
 ENABLE_DEATH=true
 ENABLE_TP_ALERT=true
 ENABLE_BAN_ALERT=true
+
+# 指令佇列
+KICK_QUEUE_TTL=600         # 排隊多久沒連上就作廢（秒）
+KICK_QUEUE_MAX=50          # 佇列上限
+
+# 聯機大廳（文件：https://docs.miaaoo.com）
+MIAAOO_API_BASE=https://api.miaaoo.com
+MC_XUID=                   # 填 16 位 XUID 就跳過 /profile 查詢（換過 Gamertag 很有用）
 
 TP_KICK=true                          # 偵測到 TP 平台拉人就自動踢（要關改 false）
 TP_KICK_REASON=偵測到 TP 平台加入      # 踢出時顯示的理由
@@ -56,8 +97,26 @@ TP_AUTO_BLACKLIST=false               # 要不要順便寫進封禁名單（永�
 TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 ```
 
-> 自動踢出是靠 DLL 的鍵盤注入（`kick "名字" §c理由`），**需要遊戲視窗在前景**。
-> 若當時切到瀏覽器，踢出會失敗，Discord 會收到「自動踢出沒有成功」的提示。
+> 自動踢出走的是遊戲 WebSocket 的 `kick` 指令，**需要房主 / OP 權限**。
+
+## 聯機大廳 API（對照 docs.miaaoo.com）
+
+`bot.py` 第 6 段依官方 v2 文件實作，只用到這幾個端點：
+
+| 用途 | 端點 | 備註 |
+| --- | --- | --- |
+| 房間列表 | `GET /v2/list` | `lang` 可重複傳（`?lang=zh&lang=en`）；30 秒刷新一次快取 |
+| 帳號清單 | `GET /v2/account` | 回傳 `[{id, name, canaddfriends}]`，`addid` 取 `canaddfriends=true` 那個的 `id` |
+| 查 XUID | `GET /profile?gt=名字` | XUID 在 `profileUsers[0].id`；`gt` 與 `xuid` 不可同時傳 |
+| 房間詳情 | `GET /roominfo?session=&roomfrom=` | `members[]` 裡有 `gamertag` / `xuid` |
+| 加入房間 | `POST /v2/join` | 用**新版協議** `apiversion: 2`，`userxuid` 必填（16 位） |
+| 刷新粉絲 | `GET /refreshFollowers` | 回應碼不可靠；10 秒內重複呼叫只回 206 |
+
+舊版程式有三處偏差，已修正：房間列表誤打 `/roominfo`（一直空）、
+`addid` 找錯欄位名、XUID 從 `profile["xuid"]` 讀（實際在 `profileUsers[0].id`）。
+
+加入成功後**不會**產生任何邀請網址——後端是先把你的帳號加進該帳號的粉絲、再發 Xbox 邀請，
+所以正確做法是：開遊戲 → `世界` 分頁 → 重新整理 → 點房間卡片加入。
 
 ## 原始碼
 `src/dll/*.cpp`、`src/exe/*.cpp`、`bot.py`
@@ -65,14 +124,15 @@ TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 ## 程式結構
 
 ```
-bot.py                 單檔程式（v9.1），依「目錄」分段：
+bot.py                 單檔程式（v9.3），依「目錄」分段：
   1  設定與日誌          .env 讀取、輪替式 bot.log（5MB × 3）
   2  文字工具            § 色碼、rawtext、UI 洗頻
   3  JSON 檔案存放       白名單 / 封禁名單 / 頻道設定（原子寫入）
   4  WebSocket 伺服器    收事件、去重、送指令、斷線自動重試
   5  HTTP 封禁 API       127.0.0.1:3001
-  6  Miaaoo 聯機大廳 API
-  7  Discord 客戶端      事件轉發 + 斜線 / 文字指令
+  6  聯機大廳 API        /v2/list、/v2/account、/profile、/roominfo、/v2/join
+  7  Discord 客戶端      事件轉發 + 斜線指令 + 指令佇列
+      Room / RoomPaginator / DCListener
   8  組裝與進入點        單一實例鎖、啟動、關閉
 
 old_bridge_20261107/   合併前的 bridge/ 套件（備份，可刪）

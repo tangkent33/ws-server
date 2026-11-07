@@ -37,10 +37,11 @@ import socket
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import discord
@@ -51,7 +52,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.1.0"
+__version__ = "9.3.0"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,8 +83,14 @@ MC_PLAYER_NAME = os.getenv("MC_PLAYER_NAME", "tangkent3")
 WHITELIST_FILE = os.path.expanduser(os.getenv("WHITELIST_FILE", "~/whitelist.json"))
 BLACKLIST_FILE = str(BASE_DIR / os.getenv("BLACKLIST_FILE", "blacklist.json"))
 CONFIG_FILE = os.path.expanduser(os.getenv("BRIDGE_CONFIG_FILE", "~/bridge_config.json"))
-MIAOO_API_BASE = os.getenv("MIAOO_API_BASE", "https://api.miaaoo.com")
+# 舊變數名 MIAOO_ 少一個 A，兩種拼法都接受，避免 .env 改了名字反而失效
+MIAOO_API_BASE = (os.getenv("MIAAOO_API_BASE")
+                  or os.getenv("MIAOO_API_BASE")
+                  or "https://api.miaaoo.com").rstrip("/")
 OWNER_ID = os.getenv("OWNER_ID", "tangkent3")
+
+# 自己的 XUID：填了就完全跳過 /profile 查詢（換過 Gamertag 時很有用）
+MC_XUID = (os.getenv("MC_XUID") or "").strip()
 
 # ------------------------------------------------------------------ 封禁
 TP_BAN_MINUTES = _env_int("TP_BAN_MINUTES", 0)              # 0 = 永久
@@ -94,6 +101,10 @@ ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
 TP_KICK = _env_bool("TP_KICK", "true")
 TP_KICK_REASON = os.getenv("TP_KICK_REASON", "偵測到 TP 平台加入")
 TP_KICK_COOLDOWN = _env_int("TP_KICK_COOLDOWN", 20)         # 同一人幾秒內不重複踢
+
+# 遊戲 WebSocket 沒連線時，指令排隊等連上再送（不再退回鍵盤注入）
+KICK_QUEUE_TTL = _env_int("KICK_QUEUE_TTL", 600)            # 排隊多久還沒連上就作廢（秒）
+KICK_QUEUE_MAX = _env_int("KICK_QUEUE_MAX", 50)             # 佇列上限，避免爆量
 
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")
@@ -739,14 +750,6 @@ class MCWebSocketServer:
         finally:
             self._pending.pop(req_id, None)
 
-    async def inject_command(self, cmd: str):
-        """請橋接器用 DLL 模擬鍵盤把指令打進遊戲（遊戲 WebSocket 沒連線時的備援）。"""
-        await self._broadcast({
-            "header": {"version": 1, "requestId": str(uuid.uuid4()),
-                       "messageType": "event", "messagePurpose": "event", "eventName": "INJECT"},
-            "body": {"commandLine": cmd},
-        })
-
     async def send_tellraw(self, text: str):
         cmd = 'tellraw @a {"rawtext":[{"text":%s}]}' % json.dumps(text, ensure_ascii=False)
         return await self.send_command(cmd, timeout=5.0)
@@ -841,18 +844,126 @@ async def start_ban_api(bot: "DCListener", store: BanStore) -> web.AppRunner:
 
 
 # ============================================================ 6. Miaaoo 聯機大廳 API
+# 依 https://docs.miaaoo.com 的 v2 介面實作（文件版 v2.0.0）：
+#   GET  /v2/list                       房間列表（lang 可重複，如 ?lang=zh&lang=en）
+#   GET  /v2/account                    中繼帳號清單 → addid 來源（canaddfriends=true 的 id）
+#   GET  /profile?gt=|xuid=             查 XUID / Gamertag（gt 與 xuid 不可同時傳）
+#   GET  /roominfo?session=&roomfrom=   單一房間詳情 + 成員名單
+#   POST /v2/join                       apiversion=2（userxuid 必填、16 位數字）
+#   GET  /refreshFollowers              刷新粉絲快取（10 秒內重複呼叫只回 206）
+#
+# 舊版有三個致命偏差，導致 /lianji 永遠空、/join 必定失敗：
+#   1. 房間列表去打 /roominfo（缺 session/roomfrom → 400）→ 應該是 /v2/list
+#   2. addid 從 /v2/account 的元素裡找 "addid" 欄位 → 實際欄位叫 id
+#   3. XUID 從 profile["xuid"] 取 → 實際在 profileUsers[0].id
+
+JOIN_CODE_TEXT = {
+    "0": "查不到房間（房主的多人遊戲可能沒開）",
+    "1": "參數不完整",
+    "2": "addid / roomfrom 不被允許（先用 /lianji me 檢查）",
+    "3": "XUID 缺失或格式錯誤（需 16 位數字）",
+    "4": "你不在該帳號的粉絲清單中，請先在 Xbox 關注它",
+    "5": "自動加入關注失敗（粉絲可能已滿 1000）",
+}
+
+WORLD_TYPE_TEXT = {
+    "Survival": "生存", "Creative": "創造", "Spectator": "旁觀",
+    "Adventure": "冒險", "Unknown": "未知",
+}
+
+
+@dataclass
+class Room:
+    """把 /v2/list 的巢狀結構壓平成好用的樣子。"""
+
+    id: str
+    session: str
+    roomfrom: str
+    host: str
+    world: str
+    mode: str
+    version: str
+    players: int
+    max_players: int
+    broadcast: int
+    lang: str
+    owner_xuid: str
+    created: str
+    hardcore: bool = False
+
+    @property
+    def joinable(self) -> bool:
+        """BroadcastSetting=3（好友的好友）才能被外部玩家加入。"""
+        return self.broadcast == 3
+
+    @property
+    def mode_text(self) -> str:
+        return WORLD_TYPE_TEXT.get(self.mode, self.mode or "未知")
+
+    @classmethod
+    def from_api(cls, raw: Dict[str, Any]) -> "Room":
+        props = raw.get("customProperties") or {}
+        session_ref = raw.get("sessionRef") or {}
+        related = raw.get("relatedInfo") or {}
+
+        def _int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            id=str(raw.get("id") or ""),
+            session=str(session_ref.get("name") or ""),
+            roomfrom=str(raw.get("roomfrom") or ""),
+            host=str(props.get("hostName") or "?"),
+            world=str(props.get("worldName") or "?").strip() or "?",
+            mode=str(props.get("worldType") or "Unknown"),
+            version=str(props.get("version") or "?"),
+            players=_int(props.get("MemberCount") or related.get("membersCount")),
+            max_players=_int(props.get("MaxMemberCount") or related.get("maxMembersCount")),
+            broadcast=_int(props.get("BroadcastSetting")),
+            lang=str(props.get("worldNameLang") or ""),
+            owner_xuid=str(props.get("ownerId") or raw.get("ownerXuid") or ""),
+            created=str(raw.get("createTime") or ""),
+            hardcore=bool(props.get("isHardcore")),
+        )
+
+    def label(self) -> str:
+        """autocomplete 用的短標籤（Discord 選項名上限 100 字）。"""
+        lock = "" if self.joinable else "🔒"
+        return _clip(f"{lock}{self.world} ｜ {self.host} ｜ {self.players}/{self.max_players}", 95)
+
+
+@dataclass
+class MiaaooResult:
+    ok: bool
+    message: str
+    status: int = 0
+    code: str = ""
+    data: Any = None
+
+
 class MiaaooAPI:
+    """聯機大廳 API 封裝。任何失敗都回傳結構化結果，不外拋例外打斷 bot。"""
+
     def __init__(self):
         self.base_url = MIAOO_API_BASE
         self.xuid: Optional[str] = None
         self.addid: Optional[str] = None
+        self.gamertag: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._rooms: List[Room] = []
+        self._rooms_at: float = 0.0
 
     async def start(self):
-        if not self._session:
+        if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers={"User-Agent": f"mc-bridge/{__version__}"},
+                timeout=aiohttp.ClientTimeout(total=15, connect=8),
+                headers={
+                    "User-Agent": f"mc-bridge/{__version__}",
+                    "Accept": "application/json",
+                },
             )
 
     async def close(self):
@@ -861,104 +972,209 @@ class MiaaooAPI:
             self._session = None
 
     # ------------------------------------------------------------ 基本請求
-    async def _get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
-        if not self._session:
-            await self.start()
+    async def _request(self, method: str, endpoint: str, *,
+                       params=None, json_body=None) -> Tuple[int, Any]:
+        """回傳 (http_status, payload)。連線或解析失敗時 status=0。"""
+        await self.start()
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        async with self._session.get(url, params=params) as resp:
-            return await resp.json(content_type=None)
+        try:
+            async with self._session.request(method, url, params=params, json=json_body) as resp:
+                status = resp.status
+                text = await resp.text()
+        except asyncio.TimeoutError:
+            return 0, {"message_zh_CN": "請求逾時（api.miaaoo.com 沒回應）"}
+        except aiohttp.ClientError as exc:
+            return 0, {"message_zh_CN": f"連線失敗：{exc}"}
 
-    async def _post(self, endpoint: str, data: Dict) -> Any:
-        if not self._session:
-            await self.start()
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        async with self._session.post(url, json=data) as resp:
-            return await resp.json(content_type=None)
+        try:
+            return status, json.loads(text)
+        except ValueError:
+            # 限流時 nginx 回的是 HTML，不是 JSON
+            hint = "（被限流，稍後再試）" if status == 429 else ""
+            return status, {"message_zh_CN": f"HTTP {status} 非 JSON 回應{hint}"}
 
-    # ------------------------------------------------------------ 端點
-    async def get_account_info(self) -> Dict[str, Any]:
-        return await self._get("v2/account")
+    async def _get(self, endpoint: str, params=None) -> Tuple[int, Any]:
+        return await self._request("GET", endpoint, params=params)
 
-    async def get_profile(self, gt: Optional[str] = None, xuid: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, str] = {}
-        if gt:
-            params["gt"] = gt
-        if xuid:
-            params["xuid"] = xuid
-        return await self._get("profile", params)
+    async def _post(self, endpoint: str, payload: Dict) -> Tuple[int, Any]:
+        return await self._request("POST", endpoint, json_body=payload)
 
-    async def get_room_info(self, session: Optional[str] = None, roomfrom: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, str] = {}
-        if session:
-            params["session"] = session
-        if roomfrom:
-            params["roomfrom"] = roomfrom
-        return await self._get("roominfo", params)
+    # ------------------------------------------------------------ 房間
+    async def list_rooms(self, lang: str = "", *, max_age: float = 25.0) -> List[Room]:
+        """GET /v2/list。lang 可用逗號分隔多個語言代碼。"""
+        if not lang and self._rooms and (time.monotonic() - self._rooms_at) < max_age:
+            return self._rooms
 
-    async def join_room_v2(self, roomid: str, sessionname: str, roomfrom: str,
-                           addid: Optional[str] = None, xuid: Optional[str] = None) -> Dict[str, Any]:
-        payload = {
-            "version": "1.0.0",
-            "joininformation": {
-                "addid": addid or self.addid,
-                "roomfrom": roomfrom,
-                "roomid": roomid,
-                "sessionname": sessionname,
-            },
-            "invitecontrol": {"userxuid": xuid or self.xuid},
+        params = None
+        wanted = [x.strip() for x in (lang or "").split(",") if x.strip()]
+        if wanted:
+            # 文件支援重複 key：?lang=zh&lang=en，所以傳 list of tuple
+            params = [("lang", code) for code in wanted]
+
+        status, data = await self._get("v2/list", params)
+        if status != 200 or not isinstance(data, dict):
+            msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+            log.error(f"取得房間列表失敗: HTTP {status} {msg or data}")
+            return [] if lang else self._rooms
+
+        rooms = [Room.from_api(r) for r in (data.get("results") or []) if isinstance(r, dict)]
+        if not lang:
+            self._rooms = rooms
+            self._rooms_at = time.monotonic()
+        log.debug(f"房間列表: {len(rooms)} 間（lang={lang or '全部'}）")
+        return rooms
+
+    def cached_rooms(self) -> List[Room]:
+        return self._rooms
+
+    async def fetch_rooms_if_stale(self, max_age: float = 60.0) -> List[Room]:
+        """autocomplete 用：沒有快取或太舊才真的打 API，避免打字就刷爆。"""
+        if self._rooms and (time.monotonic() - self._rooms_at) < max_age:
+            return self._rooms
+        return await self.list_rooms()
+
+    async def room_detail(self, room: Room) -> MiaaooResult:
+        """GET /roominfo：房間詳情 + 成員名單。"""
+        if not room.session or not room.roomfrom:
+            return MiaaooResult(False, "缺少 session 或 roomfrom，無法查詢房間")
+        status, data = await self._get("roominfo", {"session": room.session, "roomfrom": room.roomfrom})
+        if status != 200 or not isinstance(data, dict):
+            msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+            return MiaaooResult(False, msg or f"HTTP {status}", status=status, data=data)
+        return MiaaooResult(True, "", status=status, data=data)
+
+    @staticmethod
+    def parse_members(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        """roominfo.members 是 {"0": {...}, "1": {...}}，取出 gamertag / xuid。"""
+        out: List[Dict[str, str]] = []
+        members = (payload or {}).get("members") or {}
+        if not isinstance(members, dict):
+            return out
+        for key, item in members.items():
+            if not isinstance(item, dict) or not item:
+                continue
+            const = (item.get("constants") or {}).get("system") or {}
+            out.append({
+                "index": str(const.get("index", key)),
+                "gamertag": str(item.get("gamertag") or "(未知)"),
+                "xuid": str(const.get("xuid") or ""),
+                "join_time": str(item.get("joinTime") or ""),
+            })
+        out.sort(key=lambda m: int(m["index"]) if m["index"].isdigit() else 999)
+        return out
+
+    # ------------------------------------------------------------ 帳號 / 身分
+    async def list_accounts(self) -> List[Dict[str, Any]]:
+        """GET /v2/account → 中繼帳號清單 [{id, name, canaddfriends}]。"""
+        status, data = await self._get("v2/account")
+        if status != 200 or not isinstance(data, list):
+            msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+            log.warning(f"取得帳號清單失敗: HTTP {status} {msg or data}")
+            return []
+        return [a for a in data if isinstance(a, dict)]
+
+    async def resolve_addid(self, force: bool = False) -> str:
+        """addid = /v2/account 裡 canaddfriends=true 的帳號 id（目前通常 6 或 8）。"""
+        if self.addid and not force:
+            return self.addid
+        accounts = await self.list_accounts()
+        if not accounts:
+            return ""
+        usable = [a for a in accounts if a.get("canaddfriends")] or accounts
+        self.addid = str(usable[0].get("id") or "")
+        log.info(f"🔑 addid = {self.addid}（{usable[0].get('name', '')}）")
+        return self.addid
+
+    async def get_profile(self, gt: str = "", xuid: str = "") -> Dict[str, str]:
+        """GET /profile。注意 gt 與 xuid 不能同時傳（會 400）。"""
+        if not gt and not xuid:
+            return {}
+        params = {"gt": gt} if gt else {"xuid": xuid}
+        status, data = await self._get("profile", params)
+        if status != 200 or not isinstance(data, dict):
+            msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+            log.warning(f"查詢 profile 失敗: HTTP {status} {msg or data}")
+            return {}
+        users = data.get("profileUsers") or []
+        if not users or not isinstance(users[0], dict):
+            return {}
+        user = users[0]
+        settings = {s.get("id"): s.get("value")
+                    for s in (user.get("settings") or []) if isinstance(s, dict)}
+        return {
+            "xuid": str(user.get("id") or ""),
+            "gamertag": str(settings.get("Gamertag") or settings.get("GameDisplayName") or ""),
+            "avatar": str(settings.get("GameDisplayPicRaw") or ""),
         }
-        return await self._post("v2/join", payload)
 
-    async def refresh_followers(self) -> Dict[str, Any]:
-        return await self._post("refreshFollowers", {})
+    async def resolve_identity(self, force: bool = False) -> Dict[str, str]:
+        """取得 (xuid, addid)。.env 有 MC_XUID 就直接用，不必查 /profile。"""
+        if not force and self.xuid and self.addid:
+            return {"xuid": self.xuid, "addid": self.addid, "gamertag": self.gamertag or ""}
 
-    # ------------------------------------------------------------ 組合查詢
-    async def list_rooms(self) -> List[Dict]:
-        try:
-            result = await self.get_room_info()
-            if isinstance(result, dict):
-                rooms = result.get("results") or result.get("data") or []
-                if isinstance(rooms, list):
-                    return rooms
-                if "room" in result:
-                    return [result]
-                return []
-            if isinstance(result, list):
-                return result
-            return []
-        except Exception as exc:
-            log.error(f"獲取房間列表失敗: {exc}")
-            return []
+        if MC_XUID:
+            self.xuid = MC_XUID
+        addid = await self.resolve_addid(force=force)
 
-    async def get_my_xuid_and_addid(self):
-        xuid, addid = "", ""
-        account: Any = None
-        try:
-            account = await self.get_account_info()
-            if isinstance(account, dict):
-                addid = account.get("addid") or account.get("addId") or account.get("id") or ""
-                if not addid and isinstance(account.get("data"), dict):
-                    addid = account["data"].get("addid") or account["data"].get("id") or ""
-            elif isinstance(account, list) and account and isinstance(account[0], dict):
-                addid = account[0].get("addid") or account[0].get("addId") or account[0].get("id") or ""
-        except Exception as exc:
-            log.error(f"獲取 AddID 失敗: {exc}")
+        if not self.xuid:
+            profile = await self.get_profile(gt=MC_PLAYER_NAME)
+            if profile.get("xuid"):
+                self.xuid = profile["xuid"]
+                self.gamertag = profile.get("gamertag") or MC_PLAYER_NAME
 
-        try:
-            gt = MC_PLAYER_NAME
-            if isinstance(account, dict):
-                gt = account.get("gamertag") or account.get("gt") or MC_PLAYER_NAME
-                if not gt and isinstance(account.get("data"), dict):
-                    gt = account["data"].get("gamertag") or MC_PLAYER_NAME
-            profile = await self.get_profile(gt=gt)
-            if isinstance(profile, dict):
-                xuid = profile.get("xuid") or profile.get("XUID") or ""
-                if not xuid and isinstance(profile.get("data"), dict):
-                    xuid = profile["data"].get("xuid") or ""
-        except Exception as exc:
-            log.error(f"獲取 XUID 失敗: {exc}")
+        if self.xuid and not self.gamertag:
+            profile = await self.get_profile(xuid=self.xuid)
+            self.gamertag = profile.get("gamertag") or MC_PLAYER_NAME
 
-        return xuid, addid
+        return {"xuid": self.xuid or "", "addid": addid or "", "gamertag": self.gamertag or ""}
+
+    # ------------------------------------------------------------ 加入 / 刷新
+    async def join_room(self, room: Room, *, addid: str = "", xuid: str = "") -> MiaaooResult:
+        """POST /v2/join，新版協議 apiversion=2（userxuid 必填）。"""
+        addid = addid or self.addid or await self.resolve_addid()
+        xuid = xuid or self.xuid or (await self.resolve_identity()).get("xuid", "")
+
+        if not addid:
+            return MiaaooResult(False, "取不到 addid（/v2/account 沒有可用帳號）")
+        if not xuid.isdigit() or len(xuid) != 16:
+            return MiaaooResult(
+                False, f"XUID 無效（{xuid or '空'}），需 16 位數字；可在 .env 設 MC_XUID")
+        if not room.id or not room.session:
+            return MiaaooResult(False, "房間資料不完整（缺 id / session）")
+
+        payload = {
+            "apiversion": 2,
+            "joininformation": {
+                "addid": str(addid),
+                "roomfrom": str(room.roomfrom),
+                "handleid": room.id,
+                "sessionname": room.session,
+                "userxuid": str(xuid),
+            },
+        }
+        status, data = await self._post("v2/join", payload)
+        body = data if isinstance(data, dict) else {}
+        code = str(body.get("code", "") or "")
+
+        if status == 200 and code in ("1", "2", ""):
+            return MiaaooResult(True, body.get("message_zh_CN") or "加入成功", status, code, data)
+
+        detail = (JOIN_CODE_TEXT.get(code)
+                  or body.get("message_zh_CN")
+                  or body.get("message")
+                  or f"HTTP {status}")
+        log.warning(f"加入房間失敗 room={room.id} HTTP {status} code={code} {detail}")
+        return MiaaooResult(False, detail, status, code, data)
+
+    async def refresh_followers(self) -> Tuple[int, str]:
+        """GET /refreshFollowers。文件註明：回應碼不可靠，200/206/502 都算正常。"""
+        status, data = await self._get("refreshFollowers")
+        if status in (200, 206):
+            return status, "已觸發刷新（房間列表約 30 秒後更新）"
+        if status == 502:
+            return status, "部分帳號拉取失敗，但已排入刷新"
+        msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+        return status, msg or f"HTTP {status}"
 
 
 # ============================================================ 7. Discord 客戶端
@@ -967,8 +1183,96 @@ def is_admin(message: discord.Message) -> bool:
     return bool(perms and getattr(perms, "administrator", False))
 
 
+@dataclass
+class DeferredCmd:
+    """遊戲 WebSocket 沒連線時暫存的指令，連上後由 worker 補送。"""
+    cmd: str
+    label: str
+    created: float
+
+
+class RoomPaginator(discord.ui.View):
+    """房間列表分頁。每頁 6 間，避免整串超過 embed 上限。"""
+
+    PER_PAGE = 6
+
+    def __init__(self, api: MiaaooAPI, rooms: List[Room], lang: str = ""):
+        super().__init__(timeout=180)
+        self.api = api
+        self.rooms = rooms
+        self.lang = lang
+        self.page = 0
+        self._refresh_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.rooms) + self.PER_PAGE - 1) // self.PER_PAGE)
+
+    def _page_rooms(self) -> List[Room]:
+        start = self.page * self.PER_PAGE
+        return self.rooms[start:start + self.PER_PAGE]
+
+    def _refresh_buttons(self):
+        self.prev_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.total_pages - 1
+        self.page_button.label = f"{self.page + 1}/{self.total_pages}"
+
+    def build_embed(self) -> discord.Embed:
+        joinable = sum(1 for room in self.rooms if room.joinable)
+        desc = f"共 **{len(self.rooms)}** 間，可加入 **{joinable}** 間"
+        if self.lang:
+            desc += f"　語言：`{self.lang}`"
+        embed = discord.Embed(title="📋 聯機大廳", description=desc, color=0x3B82F6)
+
+        offset = self.page * self.PER_PAGE
+        for index, room in enumerate(self._page_rooms(), offset + 1):
+            badge = "🟢" if room.joinable else "🔒"
+            extra = "　💀 極限" if room.hardcore else ""
+            embed.add_field(
+                name=_clip(f"{badge} {index}. {room.world}", 250),
+                value=_clip(
+                    f"🏠 {room.host}　{room.mode_text}　👥 {room.players}/{room.max_players}\n"
+                    f"🧩 {room.version}{extra}\n`{room.id}`",
+                    1000,
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="用 /lianji join 加入　/lianji info 看成員名單")
+        return embed
+
+    async def _flip(self, interaction: discord.Interaction, delta: int):
+        self.page = min(max(0, self.page + delta), self.total_pages - 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._flip(interaction, -1)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.primary, disabled=True)
+    async def page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._flip(interaction, 1)
+
+    @discord.ui.button(label="🔄", style=discord.ButtonStyle.success)
+    async def reload_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        rooms = await self.api.list_rooms(self.lang)
+        if rooms:
+            self.rooms = sorted(rooms, key=lambda r: (not r.joinable, -r.players))
+            self.page = 0
+            self._refresh_buttons()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+
 class DCListener(discord.Client):
     """Discord 端：把遊戲事件送到頻道，並提供管理指令。"""
+
+    # 聯機大廳指令組：/lianji list|info|join|me|refresh
+    lianji = app_commands.Group(name="lianji", description="聯機大廳（Miaaoo）")
 
     def __init__(self, mc: MCWebSocketServer, whitelist: WhitelistStore,
                  blacklist: BanStore, webhook_url: str, config: BridgeConfig,
@@ -989,6 +1293,8 @@ class DCListener(discord.Client):
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
         self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
+        self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
+        self._deferred_task: Optional[asyncio.Task] = None
         self._handlers: Dict[str, Callable] = {
             "!sync": self._cmd_sync,
             "!status": self._cmd_status,
@@ -1009,6 +1315,8 @@ class DCListener(discord.Client):
 
     # ------------------------------------------------ 生命週期
     async def setup_hook(self):
+        self.tree.on_error = self.on_tree_error
+
         # 先把「全域指令」清空：舊版本殘留的全域 /ping 等會造成
         # CommandSignatureMismatch，而且全域指令更新要等 Discord 快取，
         # 所以一律改用 guild 指令。
@@ -1019,8 +1327,16 @@ class DCListener(discord.Client):
         except Exception as exc:
             log.error(f"清空全域指令失敗: {exc}")
 
-        for cmd in (self.slash_status, self.slash_ping, self.slash_lianji, self.slash_join):
+        for cmd in (self.slash_status, self.slash_ping, self.slash_players,
+                    self.slash_check, self.slash_cmd,
+                    self.slash_kick, self.slash_ban, self.slash_unban, self.slash_banned,
+                    self.slash_settings, self.slash_sync, self.slash_wl,
+                    self.slash_join, self.lianji):
             self.tree.add_command(cmd)
+
+        # 遊戲 WebSocket 沒連線時，指令排隊等它連上再送
+        if self._deferred_task is None or self._deferred_task.done():
+            self._deferred_task = asyncio.create_task(self._deferred_worker())
 
     async def on_disconnect(self):
         log.warning("⚠️ Discord 連線中斷，準備重連")
@@ -1042,21 +1358,65 @@ class DCListener(discord.Client):
             await self._sync_guild_commands(pending)
 
     async def close(self):
+        if self._deferred_task and not self._deferred_task.done():
+            self._deferred_task.cancel()
+            try:
+                await self._deferred_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._session:
             await self._session.close()
             self._session = None
         await super().close()
 
     async def _sync_guild_commands(self, guilds=None):
+        """把本地指令樹同步到伺服器。
+
+        關鍵：同步前先清空該伺服器的指令樹，否則舊版殘留（改了參數的 /status、
+        已刪掉的 /join…）會留在 Discord 上，使用者一按就 CommandSignatureMismatch。
+        """
         for guild in (guilds if guilds is not None else self.guilds):
-            try:
-                obj = discord.Object(id=guild.id)
-                self.tree.copy_global_to(guild=obj)
-                await self.tree.sync(guild=obj)
-                self._synced_guilds.add(guild.id)
-                log.info(f"🧹 已同步 {guild.name} 的斜線指令")
-            except Exception as exc:
-                log.warning(f"同步 {guild.name} 的斜線指令失敗: {exc}")
+            obj = discord.Object(id=guild.id)
+            names = ""
+            for attempt in range(1, 4):
+                try:
+                    self.tree.clear_commands(guild=obj)
+                    self.tree.copy_global_to(guild=obj)
+                    synced = await self.tree.sync(guild=obj)
+                    names = ", ".join(sorted(f"/{c.name}" for c in synced))
+                    self._synced_guilds.add(guild.id)
+                    log.info(f"🧹 已同步 {guild.name} 的 {len(synced)} 個指令: {names}")
+                    break
+                except Exception as exc:
+                    log.warning(f"同步 {guild.name} 失敗（第 {attempt} 次）: {exc}")
+                    if attempt < 3:
+                        await asyncio.sleep(2 * attempt)
+            else:
+                log.error(f"❌ {guild.name} 的斜線指令同步失敗，Discord 上可能還是舊的")
+
+    async def on_tree_error(self, interaction: discord.Interaction, error: Exception):
+        """指令簽名不符時自動重新同步，而不是只丟一大段 traceback。"""
+        if isinstance(error, app_commands.CommandSignatureMismatch):
+            cmd_name = getattr(interaction.command, "name", "?")
+            log.warning(f"⚠️ /{cmd_name} 的簽名與 Discord 不符，自動重新同步")
+            self._synced_guilds.clear()
+            targets = [interaction.guild] if interaction.guild else None
+            await self._sync_guild_commands(targets)
+            text = ("🔄 **指令定義已更新，已自動重新同步**\n"
+                    "請再試一次；如果還是不行，重開 Discord 用戶端（Ctrl+R）讓它刷新指令快取。")
+        elif isinstance(error, app_commands.CheckFailure):
+            text = "❌ 你沒有權限使用這個指令"
+        else:
+            log.error(f"斜線指令 /{getattr(interaction.command, 'name', '?')} 執行失敗: {error!r}")
+            text = f"❌ 執行失敗：{error}"
+
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(text, ephemeral=True)
+            else:
+                await interaction.followup.send(text, ephemeral=True)
+        except Exception:
+            pass
 
     # ------------------------------------------------ Discord → 遊戲
     async def on_message(self, message: discord.Message):
@@ -1248,133 +1608,556 @@ class DCListener(discord.Client):
         log.info("🔴 橋接程式已斷線")
 
     # ------------------------------------------------ 踢人
+    async def send_game_command(self, cmd: str, label: str = "", timeout: float = 8.0) -> str:
+        """送指令給遊戲。WebSocket 沒連線就排隊，等連上再送。
+
+        以前沒連線時會退回「鍵盤注入」，但那需要遊戲在前景、而且只保證按鍵打出去，
+        既不確定成功又會誤導；現在一律排隊，連上後自動補送。
+        """
+        label = label or cmd
+
+        if self.mc.game_clients():
+            result = await self.mc.send_command(cmd, timeout=timeout)
+            log.info(f"🎮 {label} → {result or '（無回應）'}")
+            return result or "（無回應）"
+
+        if len(self._deferred) >= KICK_QUEUE_MAX:
+            log.warning(f"⏳ 指令佇列已滿（{KICK_QUEUE_MAX}），丟棄: {label}")
+            return "（佇列已滿，未執行）"
+
+        self._deferred.append(DeferredCmd(cmd=cmd, label=label, created=time.monotonic()))
+        log.warning(f"⏳ 遊戲 WebSocket 未連線，已排隊 #{len(self._deferred)}: {label}")
+        return "⏳ 遊戲 WebSocket 未連線，已排入佇列，連上後自動執行"
+
     async def kick_player(self, player: str, reason: str = "黑名單") -> str:
         if not ENABLE_COMMAND:
             log.warning("ENABLE_COMMAND=false，略過 kick")
             return "（指令傳送已停用）"
         cmd = f'kick "{player}" §c{reason}'
-        if self.mc.game_clients():
-            result = await self.mc.send_command(cmd, timeout=5)
-        else:
-            await self.mc.inject_command(cmd)
-            result = "已改用鍵盤注入（遊戲 WebSocket 未連線）"
-        log.info(f"👢 kick {player} → {result}")
-        return result or "（無回應）"
+        return await self.send_game_command(cmd, f"踢出 {player}（{reason}）")
+
+    async def _deferred_worker(self):
+        """等遊戲 WebSocket 連上後，依序補送排隊的指令。"""
+        while True:
+            try:
+                if not self._deferred:
+                    await asyncio.sleep(2)
+                    continue
+
+                now = time.monotonic()
+                # 先清掉放太久的：遊戲一直沒連上就不該在幾小時後突然踢人
+                while self._deferred and now - self._deferred[0].created > KICK_QUEUE_TTL:
+                    item = self._deferred.popleft()
+                    log.warning(f"⌛ 排隊逾時（{KICK_QUEUE_TTL}s）作廢: {item.label}")
+                    await self._send_to_discord(
+                        "防禦系統",
+                        f"⌛ **排隊指令已作廢**\n{item.label}\n"
+                        f"（遊戲 {KICK_QUEUE_TTL // 60} 分鐘內都沒連上）",
+                    )
+
+                if not self._deferred or not self.mc.game_clients():
+                    await asyncio.sleep(2)
+                    continue
+
+                item = self._deferred.popleft()
+                waited = int(now - item.created)
+                result = await self.mc.send_command(item.cmd, timeout=8)
+                log.info(f"🎮 補送排隊指令（等了 {waited}s）{item.label} → {result or '（無回應）'}")
+                await self._send_to_discord(
+                    "防禦系統",
+                    f"▶️ **排隊指令已執行**\n{item.label}\n"
+                    f"等待 {waited} 秒\n結果: `{result or '（無回應）'}`",
+                )
+                await asyncio.sleep(0.5)      # 別把指令連續塞進遊戲
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error(f"排隊指令處理失敗: {exc}")
+                await asyncio.sleep(5)
 
     async def on_kick_result(self, text: str) -> None:
-        """DLL 回報的執行結果：ok|injected 或 fail|game not focused。"""
+        """DLL 回報的執行結果（僅在使用鍵盤注入時才會有）。"""
         status, _, detail = text.partition("|")
         if status == "ok":
-            log.info(f"✅ 踢出指令已在遊戲內執行（{detail}）")
+            log.info(f"✅ 遊戲內已執行（{detail}）")
             return
-        log.warning(f"⚠️ 自動踢出失敗：{detail}")
-        await self._send_to_discord(
-            "防禦系統",
-            f"⚠️ **自動踢出沒有成功**\n原因: `{detail}`\n"
-            f"鍵盤注入需要遊戲視窗在前景，請切回遊戲或手動踢人。",
-        )
+        log.warning(f"⚠️ 遊戲回報失敗：{detail}")
+        await self._send_to_discord("防禦系統", f"⚠️ **指令沒有成功**\n原因: `{detail}`")
 
-    # ------------------------------------------------ 斜線指令
-    @app_commands.command(name="status", description="顯示橋接狀態")
+    # ------------------------------------------------ 斜線指令：共用
+    def _may_manage(self, interaction: discord.Interaction) -> bool:
+        """管理員，或白名單使用者。"""
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if perms and perms.administrator:
+            return True
+        return self._authorized(interaction.user)
+
+    def _is_guild_admin(self, interaction: discord.Interaction) -> bool:
+        perms = getattr(interaction.user, "guild_permissions", None)
+        return bool(perms and perms.administrator)
+
+    @staticmethod
+    async def _deny(interaction: discord.Interaction,
+                    text: str = "❌ 你沒有權限（需要管理員或在白名單內）"):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            pass
+
+    def _status_embed(self) -> discord.Embed:
+        game_online = bool(self.mc.game_clients())
+        embed = discord.Embed(
+            title="🛰️ 橋接狀態",
+            color=0x22C55E if game_online else 0xEF4444,
+        )
+        embed.add_field(
+            name="遊戲 WebSocket",
+            value="🟢 已連線" if game_online else "🔴 未連線（指令會排隊等連上）",
+            inline=False,
+        )
+        embed.add_field(name="橋接器", value="🟢 已連線" if self.mc.connected else "🔴 未連線", inline=True)
+        embed.add_field(name="線上玩家", value=f"{len(self.mc.players)} 人", inline=True)
+        embed.add_field(name="待送指令", value=f"{len(self._deferred)} 筆", inline=True)
+        embed.add_field(name="模式", value="單向（遊戲→Discord）" if ONE_WAY_MODE else "雙向", inline=True)
+        embed.add_field(name="監聽", value=f"`{MC_HOST}:{MC_PORT}`", inline=True)
+        embed.add_field(name="版本", value=f"v{__version__}", inline=True)
+        if self.mc.players:
+            names = "、".join(sorted(self.mc.players)[:15])
+            embed.add_field(name="玩家名單", value=_clip(names, 1000), inline=False)
+        return embed
+
+    # ------------------------------------------------ 斜線指令：autocomplete
+    async def _room_choices(self, current: str) -> List[app_commands.Choice[str]]:
+        """房間自動補全：用快取，過期才去打 API（打字不該刷爆介面）。"""
+        try:
+            rooms = await self.miaaoo.fetch_rooms_if_stale()
+        except Exception as exc:
+            log.warning(f"房間補全失敗: {exc}")
+            return []
+        needle = (current or "").strip().lower()
+        out: List[app_commands.Choice[str]] = []
+        for room in rooms:
+            haystack = f"{room.world} {room.host} {room.id}".lower()
+            if needle and needle not in haystack:
+                continue
+            out.append(app_commands.Choice(name=room.label(), value=room.id))
+            if len(out) >= 25:
+                break
+        return out
+
+    async def room_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._room_choices(current)
+
+    async def player_autocomplete(self, interaction: discord.Interaction, current: str):
+        needle = (current or "").strip().lower()
+        names = sorted(self.mc.players)
+        return [app_commands.Choice(name=n, value=n)
+                for n in names if needle in n.lower()][:25]
+
+    async def _find_room(self, room_id: str) -> Optional[Room]:
+        room_id = (room_id or "").strip()
+        if not room_id:
+            return None
+        for room in self.miaaoo.cached_rooms():
+            if room.id == room_id:
+                return room
+        rooms = await self.miaaoo.list_rooms()
+        return next((r for r in rooms if r.id == room_id), None)
+
+    # ------------------------------------------------ 斜線指令：基本
+    @app_commands.command(name="status", description="橋接與機器人狀態")
     async def slash_status(self, interaction: discord.Interaction):
-        await interaction.response.send_message(self._status_text(), ephemeral=True)
+        await interaction.response.send_message(embed=self._status_embed(), ephemeral=True)
 
     @app_commands.command(name="ping", description="測試機器人是否在線")
     async def slash_ping(self, interaction: discord.Interaction):
         await interaction.response.send_message("🏓 Pong！機器人運作正常！", ephemeral=True)
 
-    @app_commands.command(name="lianji", description="查詢 Miaaoo 聯機大廳的房間列表")
-    async def slash_lianji(self, interaction: discord.Interaction):
-        if not self._authorized(interaction.user):
-            await interaction.response.send_message("❌ 你不在白名單中", ephemeral=True)
+    @app_commands.command(name="players", description="列出線上玩家")
+    async def slash_players(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        names: List[str] = []
+        source = ""
+        if self.mc.game_clients():
+            raw = self._clean_result(await self.mc.send_command("list", timeout=8))
+            names = extract_players(raw)
+            source = "遊戲回報"
+        if not names:
+            names = sorted(self.mc.players)
+            source = "橋接事件快取"
+
+        embed = discord.Embed(title=f"👥 線上玩家（{len(names)}）", color=0x3B82F6)
+        embed.description = _clip("、".join(names), 1900) if names else "📋 目前沒有玩家在線"
+        if source and names:
+            embed.set_footer(text=f"來源：{source}")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="check", description="檢查伺服器狀態（時間 / 天氣 / 種子）")
+    async def slash_check(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        if not self.mc.game_clients():
+            embed = discord.Embed(title="🔴 遊戲 WebSocket 未連線",
+                                  description="遊戲端沒有連上橋接器，查不到時間/天氣。",
+                                  color=0xEF4444)
+            embed.add_field(name="橋接器", value="🟢 已連線" if self.mc.connected else "🔴 未連線")
+            await interaction.followup.send(embed=embed)
             return
 
-        await interaction.response.defer()
-        try:
-            rooms = await self.miaaoo.list_rooms()
-            if not rooms:
-                await interaction.followup.send("📋 目前沒有可用的房間")
-                return
+        results = await asyncio.gather(
+            self.mc.send_command("list", timeout=10),
+            self.mc.send_command("time query daytime", timeout=10),
+            self.mc.send_command("weather query", timeout=10),
+            self.mc.send_command("seed", timeout=10),
+            return_exceptions=True,
+        )
+        list_raw, time_raw, weather_raw, seed_raw = (self._clean_result(r) for r in results)
+        players = extract_players(list_raw)
 
-            lines = ["**📋 可加入的房間列表：**", ""]
-            for i, room in enumerate(rooms[:20], 1):
-                props = room.get("customProperties", {}) or {}
-                joinable = "🟢 可加入" if props.get("BroadcastSetting", 0) == 3 else "🔒 不可加入"
-                lines.append(
-                    f"**{i}. {props.get('worldName', '未知地圖')}**\n"
-                    f"  🏠 房主: {props.get('hostName', '未知房主')}\n"
-                    f"  👥 {props.get('MemberCount', 0)}/{props.get('MaxMemberCount', 0)} 人\n"
-                    f"  📌 模式: {props.get('worldType', '未知模式')}\n"
-                    f"  📦 版本: {props.get('version', '未知版本')}\n"
-                    f"  🆔 ID: `{room.get('id', 'N/A')}`\n"
-                    f"  🔗 {joinable}\n"
-                )
-            lines.append(f"\n共 {len(rooms)} 個房間")
-            lines.append("使用 `/join <ID>` 加入房間")
-            await interaction.followup.send(_clip("\n".join(lines)))
-        except Exception as exc:
-            log.error(f"Lianji 錯誤: {exc}")
-            await interaction.followup.send(f"❌ 查詢失敗：{exc}")
+        embed = discord.Embed(title="📊 伺服器狀態", color=0x3B82F6)
+        embed.add_field(name="👥 線上", value=f"{len(players)} 人", inline=True)
+        embed.add_field(name="👑 房主", value=OWNER_ID, inline=True)
+        embed.add_field(name="🎮 連線", value="🟢" if self.mc.game_clients() else "🔴", inline=True)
+        if time_raw:
+            embed.add_field(name="⏰ 時間", value=_clip(time_raw, 500), inline=False)
+        if weather_raw:
+            embed.add_field(name="🌤️ 天氣", value=_clip(weather_raw, 500), inline=False)
+        if seed_raw:
+            embed.add_field(name="🌍 種子", value=_clip(seed_raw, 500), inline=False)
+        if players:
+            embed.add_field(name="玩家", value=_clip("、".join(players), 1000), inline=False)
+        await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="join", description="加入指定的 Miaaoo 房間")
-    async def slash_join(self, interaction: discord.Interaction, roomid: str):
-        if not self._authorized(interaction.user):
-            await interaction.response.send_message("❌ 你不在白名單中", ephemeral=True)
+    @app_commands.command(name="cmd", description="在遊戲內執行 Minecraft 指令")
+    @app_commands.describe(command="不用打斜線，例如 time set day")
+    async def slash_cmd(self, interaction: discord.Interaction, command: str):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        cmd = normalize_cmd(command)
+        token = first_token(cmd)
+        if token in COMMAND_BLACKLIST:
+            await interaction.response.send_message(
+                f"🚫 `{token}` 在禁用清單（.env 的 COMMAND_BLACKLIST）", ephemeral=True)
             return
 
-        await interaction.response.defer()
-        try:
-            if not self.miaaoo.xuid or not self.miaaoo.addid:
-                await interaction.followup.send("🔑 正在獲取 XUID 和 AddID...")
-                xuid, addid = await self.miaaoo.get_my_xuid_and_addid()
-                if not xuid or not addid:
-                    await interaction.followup.send("❌ 無法獲取 XUID 或 AddID")
-                    return
-                self.miaaoo.xuid, self.miaaoo.addid = xuid, addid
+        await interaction.response.defer(thinking=True)
+        result = await self.send_game_command(cmd, f"/cmd {cmd}", timeout=15)
+        if result.startswith("⏳"):
+            await interaction.followup.send(result)
+            return
+        embed = discord.Embed(title=f"📋 /{_clip(cmd, 200)}", color=0x3B82F6)
+        embed.description = _clip(result, 1900) or "（沒有回應）"
+        await interaction.followup.send(embed=embed)
 
-            rooms = await self.miaaoo.list_rooms()
-            target = next((r for r in rooms if r.get("id") == roomid), None)
-            if not target:
-                await interaction.followup.send(f"❌ 找不到房間 ID: {roomid}")
-                return
+    # ------------------------------------------------ 斜線指令：封禁 / 踢人
+    @app_commands.command(name="kick", description="踢出玩家（不加入封禁名單）")
+    @app_commands.describe(player="玩家名稱", reason="踢出理由")
+    @app_commands.autocomplete(player=player_autocomplete)
+    async def slash_kick(self, interaction: discord.Interaction, player: str,
+                         reason: str = "由管理員踢出"):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
 
-            sessionname = (target.get("sessionRef") or {}).get("name", "")
-            roomfrom = target.get("roomfrom", "6")
-            props = target.get("customProperties", {}) or {}
-            world_name = props.get("worldName", "未知地圖")
-            host_name = props.get("hostName", "未知房主")
+        await interaction.response.defer(thinking=True)
+        result = await self.kick_player(player, reason)
+        queued = result.startswith("⏳")
+        embed = discord.Embed(
+            title=f"{'⏳' if queued else '👢'} 踢出 {player}",
+            color=0xF59E0B if queued else 0x3B82F6,
+        )
+        embed.add_field(name="理由", value=_clip(reason, 500), inline=False)
+        embed.add_field(name="結果", value=_clip(result, 1000), inline=False)
+        await interaction.followup.send(embed=embed)
 
-            await interaction.followup.send(f"🎮 正在加入房間 **{world_name}**...")
-            result = await self.miaaoo.join_room_v2(roomid, sessionname, roomfrom)
+    @app_commands.command(name="ban", description="封禁玩家（寫入名單並踢出）")
+    @app_commands.describe(player="玩家名稱", minutes="封禁分鐘數，0 或留空 = 永久",
+                           reason="封禁理由")
+    @app_commands.autocomplete(player=player_autocomplete)
+    async def slash_ban(self, interaction: discord.Interaction, player: str,
+                        minutes: int = 0, reason: str = ""):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
 
-            status_str = "" if result.get("status") is None else str(result.get("status"))
-            code_str = "" if result.get("code") is None else str(result.get("code"))
-            msg = result.get("message_zh_CN", result.get("message", ""))
-            invite_url = f"https://lian.gt.tc/zh/share.html?name={roomid}"
+        await interaction.response.defer(thinking=True)
+        rec = self.blacklist.ban(player, reason, max(0, minutes), str(interaction.user))
+        result = await self.kick_player(player, rec["reason"])
+        queued = result.startswith("⏳")
 
-            if status_str == "200":
-                if code_str == "2":
-                    embed = discord.Embed(title="✅ 加入成功！",
-                                          description=f"已成功加入房間 **{world_name}**",
-                                          color=discord.Color.green())
-                    embed.add_field(name="🏠 房主", value=host_name, inline=True)
-                    embed.add_field(name="🆔 房間 ID", value=roomid, inline=True)
-                    embed.add_field(name="🔗 邀請連結", value=f"[點擊加入]({invite_url})", inline=False)
-                    embed.add_field(name="📋 邀請網址", value=f"`{invite_url}`", inline=False)
-                    await interaction.followup.send(embed=embed)
-                elif code_str == "1":
-                    await interaction.followup.send(f"⚠️ **部分成功**\n{msg}\n\n🔗 邀請連結：{invite_url}")
-                else:
-                    await interaction.followup.send(f"✅ {msg}\n\n🔗 邀請連結：{invite_url}")
-            elif status_str == "400":
-                await interaction.followup.send(f"❌ 參數錯誤：{msg}")
-            elif status_str == "404":
-                await interaction.followup.send(f"❌ 房間不存在：{msg}")
+        embed = discord.Embed(
+            title=f"{'⏳' if queued else '🔨'} 已封禁 {player}",
+            color=0xF59E0B if queued else 0xEF4444,
+        )
+        embed.add_field(name="理由", value=_clip(rec["reason"], 500), inline=False)
+        embed.add_field(name="期限", value=f"{minutes} 分鐘" if minutes else "永久", inline=True)
+        embed.add_field(name="操作人", value=str(interaction.user), inline=True)
+        embed.add_field(name="結果", value=_clip(result, 1000), inline=False)
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="unban", description="解除封禁")
+    @app_commands.describe(player="玩家名稱")
+    @app_commands.autocomplete(player=player_autocomplete)
+    async def slash_unban(self, interaction: discord.Interaction, player: str):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        ok = self.blacklist.unban(player)
+        await interaction.response.send_message(
+            f"✅ 已解除 **{player}** 的封禁" if ok else f"⚠️ **{player}** 本來就不在名單裡",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="banned", description="查看封禁名單")
+    async def slash_banned(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        items = self.blacklist.items()
+        if not items:
+            await interaction.response.send_message("📋 封禁名單是空的", ephemeral=True)
+            return
+
+        lines = []
+        for item in items[:20]:
+            until = item.get("until")
+            if until:
+                expiry = time.strftime("%m-%d %H:%M", time.localtime(until / 1000))
+                lines.append(f"`{item['name']}` — {item.get('reason', '')}（到 {expiry}）")
             else:
-                await interaction.followup.send(f"❌ 伺服器錯誤：{msg}")
-        except Exception as exc:
-            log.error(f"Join 錯誤: {exc}")
-            await interaction.followup.send(f"❌ 加入失敗：{exc}")
+                lines.append(f"`{item['name']}` — {item.get('reason', '')}（永久）")
+        embed = discord.Embed(title=f"🔨 封禁名單（{len(items)}）",
+                              description=_clip("\n".join(lines), 3900), color=0xEF4444)
+        if len(items) > 20:
+            embed.set_footer(text=f"只顯示前 20 筆，共 {len(items)} 筆")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ------------------------------------------------ 斜線指令：設定
+    @app_commands.command(name="settings", description="查看目前設定")
+    async def slash_settings(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        guild = self.get_guild(self.config.guild_id) if self.config.guild_id else None
+        channel = self.get_channel(self.config.channel_id) if self.config.channel_id else None
+        embed = discord.Embed(title="⚙️ 當前設定", color=0x3B82F6)
+        embed.add_field(name="伺服器", value=self._describe_guild(guild), inline=False)
+        embed.add_field(name="頻道", value=self._describe_channel(channel), inline=False)
+        embed.add_field(name="Minecraft",
+                        value="🟢 已連線" if self.mc.game_clients() else "🔴 未連線", inline=True)
+        embed.add_field(name="房主", value=OWNER_ID, inline=True)
+        embed.add_field(name="XUID", value=f"`{self.miaaoo.xuid or '未獲取'}`", inline=True)
+        embed.add_field(name="AddID", value=f"`{self.miaaoo.addid or '未獲取'}`", inline=True)
+        embed.add_field(name="API", value=f"`{self.miaaoo.base_url}`", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="sync", description="重新同步斜線指令（改版後用）")
+    async def slash_sync(self, interaction: discord.Interaction):
+        if not self._is_guild_admin(interaction):
+            return await self._deny(interaction, "❌ 需要管理員權限")
+
+        await interaction.response.defer(ephemeral=True)
+        self._synced_guilds.clear()
+        await self._sync_guild_commands()
+        await interaction.followup.send("✅ 已重新同步斜線指令", ephemeral=True)
+
+    @app_commands.command(name="wl", description="白名單管理")
+    @app_commands.describe(action="操作", user="Discord 使用者 ID 或名稱")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="新增", value="add"),
+        app_commands.Choice(name="移除", value="del"),
+        app_commands.Choice(name="清單", value="list"),
+    ])
+    async def slash_wl(self, interaction: discord.Interaction,
+                       action: app_commands.Choice[str], user: Optional[str] = None):
+        if not self._is_guild_admin(interaction):
+            return await self._deny(interaction, "❌ 需要管理員權限")
+
+        if action.value == "list":
+            users = self.whitelist.users
+            text = "、".join(sorted(users)) if users else "（空）"
+            await interaction.response.send_message(
+                _clip(f"📋 **白名單**\n{text}", 1900), ephemeral=True)
+            return
+
+        if not user:
+            await interaction.response.send_message(
+                "❌ 請提供要操作的使用者（建議用 Discord ID）", ephemeral=True)
+            return
+
+        if action.value == "add":
+            ok = self.whitelist.add(user)
+            await interaction.response.send_message(
+                f"✅ 已新增 `{user}`" if ok else f"⚠️ `{user}` 已在白名單中", ephemeral=True)
+        else:
+            ok = self.whitelist.remove(user)
+            await interaction.response.send_message(
+                f"✅ 已移除 `{user}`" if ok else f"❌ `{user}` 不在白名單中", ephemeral=True)
+
+    # ------------------------------------------------ 斜線指令：聯機大廳
+    @lianji.command(name="list", description="查看聯機大廳房間列表")
+    @app_commands.describe(lang="語言篩選：zh / en / ja，多個用逗號分隔；留空 = 全部")
+    async def lianji_list(self, interaction: discord.Interaction, lang: str = ""):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        rooms = await self.miaaoo.list_rooms(lang)
+        if not rooms:
+            await interaction.followup.send(
+                "📋 **目前沒有房間**\n"
+                "可能是 API 被限流或 Redis 剛好沒資料，房間列表每 30 秒刷新一次。")
+            return
+
+        rooms = sorted(rooms, key=lambda r: (not r.joinable, -r.players))
+        view = RoomPaginator(self.miaaoo, rooms, lang)
+        await interaction.followup.send(embed=view.build_embed(), view=view)
+
+    @lianji.command(name="info", description="查看房間詳情與成員名單")
+    @app_commands.describe(room="選擇房間（輸入關鍵字可搜尋）")
+    @app_commands.autocomplete(room=room_autocomplete)
+    async def lianji_info(self, interaction: discord.Interaction, room: str):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        target = await self._find_room(room)
+        if not target:
+            await interaction.followup.send(f"❌ 找不到房間：`{room}`（可能已關閉，列表 30 秒更新）")
+            return
+
+        detail = await self.miaaoo.room_detail(target)
+        members = MiaaooAPI.parse_members(detail.data) if detail.ok else []
+
+        embed = discord.Embed(
+            title=f"🏠 {target.world}",
+            description=f"房主 **{target.host}**　{target.mode_text}"
+                        + ("　💀 極限" if target.hardcore else ""),
+            color=0x22C55E if target.joinable else 0x94A3B8,
+        )
+        embed.add_field(name="👥 人數",
+                        value=f"{target.players}/{target.max_players}", inline=True)
+        embed.add_field(name="🧩 版本", value=target.version, inline=True)
+        embed.add_field(name="🔗 可加入",
+                        value="🟢 是" if target.joinable else f"🔒 否（{target.broadcast}）", inline=True)
+        embed.add_field(name="🆔 房間 ID", value=f"`{target.id}`", inline=False)
+
+        if not detail.ok:
+            embed.add_field(name="⚠️ 成員名單", value=_clip(detail.message, 500), inline=False)
+        elif members:
+            # 標出「平台成員」與「遊戲內實際玩家」的差集，方便看有沒有異常加入
+            in_game = {p.lower() for p in self.mc.players}
+            lines = []
+            for m in members[:20]:
+                mark = "🟢" if m["gamertag"].lower() in in_game else "⚪"
+                lines.append(f"{mark} {m['gamertag']}")
+            embed.add_field(name=f"👤 成員（{len(members)}）",
+                            value=_clip("\n".join(lines), 1000), inline=False)
+            embed.set_footer(text="🟢 = 遊戲內也有偵測到　⚪ = 只在平台名單")
+        else:
+            embed.add_field(name="👤 成員", value="（取不到成員名單）", inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    async def _join_flow(self, interaction: discord.Interaction, room: str):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        target = await self._find_room(room)
+        if not target:
+            await interaction.followup.send(f"❌ 找不到房間：`{room}`（可能已關閉，列表 30 秒更新）")
+            return
+        if not target.joinable:
+            await interaction.followup.send(
+                f"🔒 **{target.world}** 目前不可加入\n"
+                f"BroadcastSetting = {target.broadcast}，要 3（好友的好友）才能被外部加入。")
+            return
+
+        ident = await self.miaaoo.resolve_identity()
+        xuid = ident.get("xuid", "")
+        if not xuid or not xuid.isdigit() or len(xuid) != 16:
+            await interaction.followup.send(
+                "❌ 取不到有效的 XUID（需要 16 位數字）\n"
+                f"目前：`{xuid or '空'}`\n"
+                "解法：在 `.env` 設 `MC_XUID=你的16位XUID`，或確認 `MC_PLAYER_NAME` 是正確的 Gamertag。")
+            return
+
+        result = await self.miaaoo.join_room(target, xuid=xuid, addid=ident.get("addid", ""))
+        if result.ok:
+            embed = discord.Embed(title="✅ 加入請求已送出", color=0x22C55E)
+            embed.description = (
+                f"房間：**{target.world}**（房主 {target.host}）\n\n"
+                "**下一步**：打開遊戲 → `世界` 分頁 → 點重新整理，房間卡片就會出現，點它加入。\n"
+                "（後端會先把你的帳號加進該帳號的粉絲，再發邀請，所以直接開世界列表就行）"
+            )
+            embed.set_footer(text=f"XUID {xuid}｜addid {ident.get('addid', '')}｜roomfrom {target.roomfrom}")
+        else:
+            embed = discord.Embed(title="❌ 加入失敗", color=0xEF4444)
+            embed.description = _clip(result.message, 1500)
+            embed.add_field(name="HTTP", value=f"`{result.status}`", inline=True)
+            embed.add_field(name="code", value=f"`{result.code or '-'}`", inline=True)
+            embed.add_field(name="房間", value=f"`{target.id}`", inline=False)
+        await interaction.followup.send(embed=embed)
+
+    @lianji.command(name="join", description="加入指定房間")
+    @app_commands.describe(room="選擇房間（輸入關鍵字可搜尋）")
+    @app_commands.autocomplete(room=room_autocomplete)
+    async def lianji_join(self, interaction: discord.Interaction, room: str):
+        await self._join_flow(interaction, room)
+
+    @app_commands.command(name="join", description="加入指定房間（快捷，等同 /lianji join）")
+    @app_commands.describe(room="選擇房間（輸入關鍵字可搜尋）")
+    @app_commands.autocomplete(room=room_autocomplete)
+    async def slash_join(self, interaction: discord.Interaction, room: str):
+        await self._join_flow(interaction, room)
+
+    @lianji.command(name="me", description="查看自己的 XUID / addid 與可用帳號")
+    async def lianji_me(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        ident = await self.miaaoo.resolve_identity(force=True)
+        accounts = await self.miaaoo.list_accounts()
+
+        embed = discord.Embed(title="🔑 我的聯機身分", color=0x3B82F6)
+        embed.add_field(name="XUID", value=f"`{ident.get('xuid') or '（取不到）'}`", inline=True)
+        embed.add_field(name="AddID", value=f"`{ident.get('addid') or '（取不到）'}`", inline=True)
+        embed.add_field(name="Gamertag", value=ident.get("gamertag") or MC_PLAYER_NAME, inline=True)
+
+        if accounts:
+            lines = [f"`{a.get('id')}` {a.get('name', '')}"
+                     + ("　✅ 可加入" if a.get("canaddfriends") else "　⛔ 不可加入")
+                     for a in accounts]
+            embed.add_field(name="中繼帳號（/v2/account）",
+                            value=_clip("\n".join(lines), 1000), inline=False)
+        else:
+            embed.add_field(name="中繼帳號", value="取不到（可能被限流，稍後再試）", inline=False)
+
+        if not MC_XUID:
+            embed.set_footer(text="想固定 XUID？在 .env 設 MC_XUID=你的16位XUID，就不必每次查 /profile")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @lianji.command(name="refresh", description="刷新後端粉絲快取（房間列表會更新）")
+    async def lianji_refresh(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        await interaction.response.defer(thinking=True)
+        status, message = await self.miaaoo.refresh_followers()
+        await interaction.followup.send(
+            f"🔄 **刷新粉絲快取**\nHTTP `{status}`\n{message}\n"
+            "房間列表由後端每 30 秒重建一次，稍等一下再用 `/lianji list`。",
+            ephemeral=True,
+        )
 
     # ------------------------------------------------ 文字指令
     def _status_text(self) -> str:
@@ -1384,19 +2167,16 @@ class DCListener(discord.Client):
 
     async def _cmd_help(self, message: discord.Message):
         await message.reply(
-            "**斜線指令**\n"
-            "`/status` 橋接狀態　`/ping` 測試\n"
-            "`/lianji` Miaaoo 房間列表　`/join <ID>` 加入房間\n\n"
-            "**查詢**\n"
-            "`!status` 橋接狀態　`!players` 線上玩家\n"
-            "`!check` 伺服器狀態（時間/天氣/種子）　`!settings` 當前設定\n\n"
-            "**封禁**\n"
-            "`!ban 名字 [分鐘] [理由]`　`!unban 名字`　`!banned`\n\n"
-            "**執行**\n"
-            "`!cmd <指令>` 執行 Minecraft 指令（有黑名單）\n"
-            "`!invite` 邀請房主\n\n"
-            "**管理（管理員）**\n"
-            "`!setguild` `!setchannel` `!reload` `!wl add/del/list` `!sync`"
+            "**斜線指令**（推薦）\n"
+            "`/status` 橋接狀態　`/players` 線上玩家　`/check` 時間/天氣/種子\n"
+            "`/lianji list` 房間列表　`/lianji info` 房間詳情　`/lianji join` 加入\n"
+            "`/lianji me` 我的 XUID　`/lianji refresh` 刷新粉絲\n"
+            "`/kick` 踢人　`/ban` 封禁　`/unban` 解封　`/banned` 名單\n"
+            "`/cmd` 執行遊戲指令　`/settings` 設定　`/sync` 同步指令　`/wl` 白名單\n\n"
+            "**文字指令**（舊版，仍可用）\n"
+            "`!status`　`!players`　`!check`　`!settings`\n"
+            "`!ban 名字 [分鐘] [理由]`　`!unban 名字`　`!banned`\n"
+            "`!cmd <指令>`　`!invite`　`!sync`　`!reload`　`!wl add/del/list`"
         )
 
     async def _cmd_status(self, message: discord.Message):
@@ -1533,14 +2313,13 @@ class DCListener(discord.Client):
         if token in COMMAND_BLACKLIST:
             await message.reply(f"❌ 指令 `{token}` 被禁止")
             return
-        if not self.mc.connected:
-            await message.reply("❌ Minecraft 未連線")
-            return
 
         status = await message.reply("⏳ 執行中...")
-        result = await self.mc.send_command(cmd, timeout=15)
-        if not result or result.startswith("⚠️"):
-            await status.edit(content="⚠️ 執行失敗（遊戲未連線或指令無回應？）")
+        result = await self.send_game_command(cmd, f"!cmd {cmd}", timeout=15)
+        if result.startswith("⏳"):
+            await status.edit(content=result)
+        elif not result or result == "（無回應）" or result.startswith("⚠️"):
+            await status.edit(content="⚠️ 執行失敗（指令無回應）")
         else:
             await status.edit(content=f"📋 結果：\n```\n{_clip(result, 1800)}\n```")
 
