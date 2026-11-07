@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.4"
+__version__ = "9.7.5"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -1595,6 +1595,7 @@ class BanRecordsCounter:
     def __init__(self):
         self.base = (os.getenv("BAN_RECORDS_API_BASE") or "").rstrip("/")
         self.token = (os.getenv("BAN_RECORDS_TOKEN") or "").strip()
+        self.on_update: Optional[Callable] = None   # 每次拿到新數字都會呼叫（fire-and-forget）
         self._session: Optional[aiohttp.ClientSession] = None
         self._count: Optional[int] = None      # None = 還沒查到過
         self._note = ""
@@ -1664,6 +1665,9 @@ class BanRecordsCounter:
         self._at = now
         self._note = ""
         log.info(f"🛡 封禁紀錄統計更新：{self._count} 名玩家")
+        if self.on_update:
+            cb = self.on_update
+            _spawn(cb(self._count))
         return self._count, ""
 
 
@@ -1914,6 +1918,8 @@ class DCListener(discord.Client):
         self._list_task: Optional[asyncio.Task] = None
         self.board = StatusBoard(self)             # 一行式狀態列
         self.ban_records = BanRecordsCounter()     # 外部封禁紀錄統計（狀態列顯示人數）
+        self.ban_records.on_update = self._announce_ban_count
+        self._ban_count_announced: Optional[int] = None  # 已打進遊戲公屏的數字（沒連線會重試）
         self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
         self._closing = False                      # close() 進來過就別再進來
         self._handlers: Dict[str, Callable] = {
@@ -2393,6 +2399,7 @@ class DCListener(discord.Client):
         # 會被整批公告成「加入了遊戲」
         self._suppress_until = time.monotonic() + 50
         self._list_miss.clear()
+        self._ban_count_announced = None   # 新房間再播一次封禁人數
         log.info("🏠 已切換房間：在線 / 已加入 / 運行時間統計重置")
         try:
             await self._send_to_discord(
@@ -2439,6 +2446,21 @@ class DCListener(discord.Client):
         if ONE_WAY_MODE:
             lines.append("（單向模式：未執行 kick）")
         await self._send_to_discord("防禦系統", "\n".join(lines))
+
+    async def _announce_ban_count(self, count: int):
+        """封禁人數更新時打一次到遊戲公屏（同一個數字只發一次；沒連上遊戲會重試）。"""
+        if not count or count == self._ban_count_announced:
+            return
+        text = f"§b[封禁系統] §f目前共封禁 §c{count} §f名玩家"
+        try:
+            ok = await self.mc.tellraw_players(text)
+        except Exception as exc:
+            log.debug(f"封禁人數公屏播報失敗: {exc}")
+            return
+        if ok:
+            self._ban_count_announced = count
+            log.info(f"📢 已在遊戲公屏播報封禁人數: {count}")
+        # ok=False（遊戲沒連線）→ 不標記，下次拿到數字再試
 
     async def _announce_tp(self, player: str) -> None:
         """把「玩家嘗試加入」打在遊戲公屏上（讓遊戲裡的人也看得到）。"""
