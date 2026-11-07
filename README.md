@@ -353,3 +353,31 @@ gradlew.bat build
 Python 端不用建置：第一次跑 `start.bat` 會自動 `pip install -r requirements.txt`
 （discord.py / aiohttp / websockets / python-dotenv），並幫你把 `.env.example`
 複製成 `.env`，填入 `DISCORD_TOKEN` 即可。
+
+## 目錄結構：本機執行 vs 上傳副本
+
+本機工作目錄同時是「執行環境」和「倉庫母本」，為了不讓上傳動作碰到
+正在用的檔案（`.env`、`*.exe`、`827dll.dll`、名單、日誌），上傳改成
+從一個獨立資料夾走：
+
+```
+ws服务器\                 ← 本機執行用（start.bat 在這裡跑）
+├─ bot.py  src\  ...      ← 程式碼（會被同步到 cloud\）
+├─ .env                    ← 只有本機有，永不上傳
+├─ 827dll.dll  MC-WS.exe   ← 編譯產物，只在這些位置
+├─ whitelist.json / blacklist.json / bot.log / statusboard.json
+├─ cloud_sync.py           ← 同步腳本（本機工具）
+├─ cloud\                  ← GitHub 倉庫的另一份 checkout，只放能公開的檔案
+│   ├─ .git
+│   ├─ bot.py  src\  gradlew  build.gradle ...
+│   └─ whitelist.json = {}   ← 雲端一律空殼
+└─ push.bat / pull.bat     ← 只從 cloud\ 上傳 / 下拉
+```
+
+- **`push.bat`**：先把清單內的檔案同步到 `cloud\`，再從 `cloud\` commit + push。
+  本機檔案（`.env`、exe、dll、名單、日誌）完全不會被讀寫或上傳。
+- **`pull.bat`**：`git -C cloud pull`，再把程式碼複製回本機；
+  名單（`whitelist.json` / `blacklist.json`）不會被覆蓋。
+- **`python cloud_sync.py --dry-run`**：只預覽會同步／刪除哪些檔案。
+- 要上傳的檔案清單寫在 `cloud_sync.py` 的 `FILES` / `SRC_DIRS`；
+  不在清單裡的東西不會出現在 GitHub 上（`cloud\` 裡的殘留會被清掉）。
