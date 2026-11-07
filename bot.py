@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.12"
+__version__ = "9.7.13"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -127,6 +127,8 @@ BOT_STARTED_AT = time.time()                                # 讀不到遊戲進
 TP_BAN_MINUTES = _env_int("TP_BAN_MINUTES", 0)              # 0 = 永久
 TP_AUTO_BLACKLIST = _env_bool("TP_AUTO_BLACKLIST")
 ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
+# 外部封禁名單（BAN_RECORDS_API_BASE，如 acz.cc.cd）命中時是否直接踢出（預設開）
+ENFORCE_EXTERNAL_BAN_ON_JOIN = _env_bool("ENFORCE_EXTERNAL_BAN_ON_JOIN", "true")
 
 # 偵測到 TP 平台拉人時：直接踢出（預設開）
 TP_KICK = _env_bool("TP_KICK", "true")
@@ -1854,6 +1856,8 @@ class BanRecordsCounter:
         self._count: Optional[int] = None      # None = 還沒查到過
         self._note = ""
         self._at = 0.0
+        self._items: List[dict] = []           # 最近一次 /list 的原始紀錄
+        self._names: Dict[str, dict] = {}      # 小寫 playerName → 紀錄
 
     @property
     def enabled(self) -> bool:
@@ -1912,10 +1916,13 @@ class BanRecordsCounter:
             self._note = f"HTTP {status}{('：' + str(msg)) if msg else ''}"
             return self._count, self._note
 
-        names = {str(r.get("playerName") or "").strip().lower()
-                 for r in items if isinstance(r, dict)}
-        names.discard("")
-        self._count = len(names)
+        self._items = [r for r in items if isinstance(r, dict)]
+        self._names = {}
+        for r in self._items:
+            nm = str(r.get("playerName") or "").strip()
+            if nm:
+                self._names[nm.lower()] = r
+        self._count = len(self._names)
         self._at = now
         self._note = ""
         log.info(f"🛡 封禁紀錄統計更新：{self._count} 名玩家")
@@ -1923,6 +1930,19 @@ class BanRecordsCounter:
             cb = self.on_update
             _spawn(cb(self._count))
         return self._count, ""
+
+    async def lookup(self, player: str) -> Optional[dict]:
+        """查一個玩家在不在外部封禁名單，回傳紀錄 dict（含 reason），不在回 None。
+
+        名單沿用 count() 的快取（CACHE_TTL），過期就重抓一次；避免每次有人加入都打 /list。
+        """
+        if not self.enabled:
+            return None
+        now = time.monotonic()
+        if not self._names or now - self._at >= self.CACHE_TTL:
+            await self.count(force=True)
+        name = str(player or "").strip().lower()
+        return self._names.get(name)
 
 
 class StatusBoard:
@@ -2852,23 +2872,37 @@ class DCListener(discord.Client):
         await self._send_to_discord("防禦系統", "\n".join(lines))
 
     async def on_player_joined(self, player: str):
-        """有人加入時檢查封禁名單（每次重讀檔案，手改 json 不用重啟）。"""
+        """有人加入時檢查封禁名單（本地 blacklist.json + 外部 BAN_RECORDS_API_BASE）。"""
         if is_platform_inviter(player):
             log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不做封禁處理")
             return
 
+        # 1) 本地封禁名單
         self.blacklist.load()
         rec = self.blacklist.get(player)
-        if not rec:
-            return
-        if not ENFORCE_BAN_ON_JOIN:
-            await self._send_to_discord("防禦系統", f"⚠️ **封禁名單玩家上線**\n玩家: **{player}**\n（未開啟自動踢）")
+        if rec:
+            if not ENFORCE_BAN_ON_JOIN:
+                await self._send_to_discord(
+                    "防禦系統", f"⚠️ **封禁名單玩家上線**\n玩家: **{player}**\n（未開啟自動踢）")
+                return
+            result = await self.kick_player(player, rec.get("reason", "黑名單"))
+            await self._send_to_discord(
+                "防禦系統",
+                f"👢 **封禁攔截**\n玩家: **{player}**\n理由: {rec.get('reason')}\n指令結果: `{result}`",
+            )
             return
 
-        result = await self.kick_player(player, rec.get("reason", "黑名單"))
+        # 2) 外部封禁名單（BAN_RECORDS_API_BASE，如 acz.cc.cd）：命中直接踢
+        if not ENFORCE_EXTERNAL_BAN_ON_JOIN:
+            return
+        ext = await self.ban_records.lookup(player)
+        if not ext:
+            return
+        reason = str(ext.get("reason") or "").strip() or "外部封禁名單"
+        result = await self.kick_player(player, reason)
         await self._send_to_discord(
             "防禦系統",
-            f"👢 **封禁攔截**\n玩家: **{player}**\n理由: {rec.get('reason')}\n指令結果: `{result}`",
+            f"👢 **外部封禁攔截**\n玩家: **{player}**\n理由: {reason}\n指令結果: `{result}`",
         )
 
     async def on_bridge_connected(self):
