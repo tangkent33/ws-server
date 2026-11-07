@@ -55,7 +55,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.4.1"
+__version__ = "9.4.2"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -334,6 +334,11 @@ class WhitelistStore:
         data = _read_json(self.path, None)
         if isinstance(data, list):
             self._data = [str(x) for x in data]
+            # .env 的 DEFAULT_AUTHORIZED_USERS 一律有效。
+            # 否則白名單檔被人清空／改壞之後，連自己都會被鎖在外面。
+            for d in self.defaults:
+                if d not in self._data:
+                    self._data.append(d)
         else:
             self._data = list(self.defaults)
             self.save()
@@ -1685,10 +1690,32 @@ class DCListener(discord.Client):
 
     def _authorized(self, author) -> bool:
         users = self.whitelist.users
-        return str(getattr(author, "id", "")) in users or getattr(author, "name", "") in users
+        if str(getattr(author, "id", "")) in users:
+            return True
+        # 名字也接受（白名單裡可能是 ID，也可能是名字）
+        names = {str(getattr(author, "name", "") or ""),
+                 str(getattr(author, "display_name", "") or "")}
+        names.discard("")
+        return bool(names & set(users))
+
+    @staticmethod
+    def _is_owner(user) -> bool:
+        """是不是 bot 擁有者（.env 的 OWNER_ID）。"""
+        if not OWNER_ID:
+            return False
+        return OWNER_ID in {str(getattr(user, "name", "") or ""),
+                            str(getattr(user, "display_name", "") or "")}
 
     def _require_admin(self, message: discord.Message) -> bool:
-        return bool(getattr(getattr(message.author, "guild_permissions", None), "administrator", False))
+        """管理員、白名單使用者、或 bot 擁有者。
+
+        以前只認伺服器管理員，導致在「自己不是管理員」的伺服器上
+        （例如別人的群）連 !sync / !wl 都會被擋成「需要管理員權限」。
+        """
+        perms = getattr(getattr(message.author, "guild_permissions", None), "administrator", False)
+        if perms:
+            return True
+        return self._authorized(message.author) or self._is_owner(message.author)
 
     # ------------------------------------------------ 遊戲 → Discord
     async def _send_to_discord(self, username: str, content: str):
@@ -1918,11 +1945,11 @@ class DCListener(discord.Client):
 
     # ------------------------------------------------ 斜線指令：共用
     def _may_manage(self, interaction: discord.Interaction) -> bool:
-        """管理員，或白名單使用者。"""
+        """管理員，或白名單使用者，或 bot 擁有者。"""
         perms = getattr(interaction.user, "guild_permissions", None)
         if perms and perms.administrator:
             return True
-        return self._authorized(interaction.user)
+        return self._authorized(interaction.user) or self._is_owner(interaction.user)
 
     def _is_guild_admin(self, interaction: discord.Interaction) -> bool:
         perms = getattr(interaction.user, "guild_permissions", None)
