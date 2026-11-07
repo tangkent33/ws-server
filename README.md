@@ -317,3 +317,16 @@ Minecraft.Windows.exe
    而且啟動時會回報版本：`[sys] dll_ready（v10.1）`。
    若看到 `[!] DLL 沒有回報版本` 就是舊版還在講話 → 關掉 Minecraft 再重開，
    之後重跑 `start.bat`（舊版約 2 分鐘沒人聽就會自己停下來）。
+
+## 從 GitHub 下載後能直接用嗎？
+
+**要先建置一次**。倉庫裡不放現成的 `MC-WS.exe` / `827dll.dll`
+（注入型 DLL 直接發佈會被防毒軟體誤殺，自己編譯一份更乾淨）：
+
+1. 安裝 Visual Studio 2022（Community 版免費），勾選「使用 C++ 的桌面開發」工作負載。
+2. 雙擊 `build.bat` —— 它會自動找 MSVC（`cl.exe`），編出 `827dll.dll` 與 `MC-WS.exe`。
+3. 之後 `start.bat` 正常使用；改了 `src/` 底下的程式碼就再跑一次 `build.bat`。
+
+Python 端不用建置：第一次跑 `start.bat` 會自動 `pip install -r requirements.txt`
+（discord.py / aiohttp / websockets / python-dotenv），並幫你把 `.env.example`
+複製成 `.env`，填入 `DISCORD_TOKEN` 即可。
