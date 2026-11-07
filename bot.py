@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.7"
+__version__ = "9.7.8"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -161,6 +161,9 @@ ENABLE_BAN_ALERT = _env_bool("ENABLE_BAN_ALERT", "true")
 ENABLE_CHAT = _env_bool("ENABLE_CHAT", "true")
 ENABLE_COMMAND = _env_bool("ENABLE_COMMAND", "true")
 
+# 單向模式：只把遊戲事件送到 Discord，不嘗試送聊天回遊戲
+ONE_WAY_MODE = _env_bool("ONE_WAY_MODE", "true")
+
 # ------------------------------------------------------------------ 遊戲內指令可開關的功能
 # 房主在遊戲聊天打「!ws」開頭的指令，就能即時開/關這些功能（不用重啟 bot）。
 # 預設值從上面的 .env 常數來；運行時只改 FEATURE_STATE，不碰 .env。
@@ -171,6 +174,8 @@ _FEATURE_DEFAULTS = {
     "tpkick": TP_KICK,
     "tpann":  TP_ANNOUNCE,
     "ban":    ENABLE_BAN_ALERT,
+    "mcdc":   ENABLE_CHAT,          # 遊戲聊天 → Discord
+    "dcmc":   (not ONE_WAY_MODE),    # Discord → 遊戲聊天
 }
 FEATURE_ALIASES = {
     "join": "join", "joinmsg": "join", "jl": "join",
@@ -179,6 +184,8 @@ FEATURE_ALIASES = {
     "tpkick": "tpkick", "kick": "tpkick",
     "tpann": "tpann", "announce": "tpann", "tpannounce": "tpann",
     "ban": "ban", "banalert": "ban",
+    "mcdc": "mcdc", "mc2dc": "mcdc", "mctodc": "mcdc", "gametodc": "mcdc",
+    "dcmc": "dcmc", "dc2mc": "dcmc", "dctomc": "dcmc", "dctogame": "dcmc",
 }
 FEATURE_NAMES = {
     "join": "加入/離開提示",
@@ -187,6 +194,8 @@ FEATURE_NAMES = {
     "tpkick": "TP 自動踢出",
     "tpann": "TP 公屏播報",
     "ban": "封禁事件提示",
+    "mcdc": "遊戲→DC 聊天",
+    "dcmc": "DC→遊戲 聊天",
 }
 FEATURE_STATE: Dict[str, bool] = dict(_FEATURE_DEFAULTS)
 
@@ -195,8 +204,6 @@ def feature_state(key: str) -> bool:
     """功能目前是開還是關（會被遊戲內 !ws 指令即時改動）。"""
     return bool(FEATURE_STATE.get(key, _FEATURE_DEFAULTS.get(key, True)))
 
-# 單向模式：只把遊戲事件送到 Discord，不嘗試送聊天回遊戲
-ONE_WAY_MODE = _env_bool("ONE_WAY_MODE", "true")
 
 # ------------------------------------------------------------------ 格式
 COMMAND_BLACKLIST = {
@@ -971,7 +978,7 @@ class MCWebSocketServer:
         if sender.lower() == MC_PLAYER_NAME.lower() and message.lstrip().lower().startswith("!ws"):
             await self._handle_game_command(message)
             return
-        if not ENABLE_CHAT:
+        if not feature_state("mcdc"):
             return
         # 單向模式下自己的訊息也照樣轉發（方便確認聊天有通）
         if not ONE_WAY_MODE and sender.lower() == MC_PLAYER_NAME.lower():
@@ -2425,7 +2432,7 @@ class DCListener(discord.Client):
         if not self._channel_allowed(message):
             return
 
-        if not ONE_WAY_MODE and self.mc.connected:
+        if feature_state("dcmc") and self.mc.connected:
             formatted = _pretty(CHAT_FORMAT_DC_TO_MC,
                                 username=message.author.display_name,
                                 message=message.clean_content)

@@ -414,9 +414,12 @@ build_gui.bat
 !ws death off      關掉死亡提示
 !ws tpann off      關掉 TP 公屏播報
 !ws ban off        關掉封禁事件提示
+!ws mcdc off       關掉「遊戲 → Discord」聊天轉發
+!ws dcmc on        開啟「Discord → 遊戲」聊天轉發
 !ws all off        一次全關
 !ws all on         一次全開
 ```
 
-可用的功能名（都有簡寫）：`join`、`death`、`tp`、`tpkick`、`tpann`、`ban`、`all`。
+可用的功能名（都有簡寫）：`join`、`death`、`tp`、`tpkick`、`tpann`、`ban`、`mcdc`、`dcmc`、`all`。
+`dcmc` 預設值 = `.env` 的 `ONE_WAY_MODE=false`（雙向），要永久改去 `.env`。
 `on/off` 也可以打「開/關」。這些只改執行中的記憶體，**重啟後回到 `.env` 的預設值**。
