@@ -160,6 +160,18 @@ TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 加入成功後**不會**產生任何邀請網址——後端是先把你的帳號加進該帳號的粉絲、再發 Xbox 邀請，
 所以正確做法是：開遊戲 → `世界` 分頁 → 重新整理 → 點房間卡片加入。
 
+## 資料檔位置
+
+```
+whitelist.json         授權使用者（Discord ID 或 遊戲名）
+blacklist.json         封禁名單
+bridge_config.json     允許的伺服器 / 頻道（預設在 ~ ，可用 BRIDGE_CONFIG_FILE 改）
+```
+
+`WHITELIST_FILE` / `BLACKLIST_FILE` 填**相對路徑**時一律以專案目錄為基準，
+填 `~` 或絕對路徑也照常運作。`.env` 的 `DEFAULT_AUTHORIZED_USERS` 一律有效，
+即使白名單檔被清空也不會把自己鎖在外面。
+
 ## 原始碼
 `src/dll/*.cpp`、`src/exe/*.cpp`、`bot.py`
 

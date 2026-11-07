@@ -55,7 +55,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.4.2"
+__version__ = "9.4.3"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -83,8 +83,19 @@ MC_PORT = _env_int("MC_WS_PORT", 8000)
 MC_PLAYER_NAME = os.getenv("MC_PLAYER_NAME", "tangkent3")
 
 # ------------------------------------------------------------------ 檔案
-WHITELIST_FILE = os.path.expanduser(os.getenv("WHITELIST_FILE", "~/whitelist.json"))
-BLACKLIST_FILE = str(BASE_DIR / os.getenv("BLACKLIST_FILE", "blacklist.json"))
+def _data_path(name: str, default: str) -> str:
+    """資料檔路徑：支援 ~ 與絕對路徑；相對路徑一律「相對於專案目錄」。
+
+    以前 WHITELIST_FILE 預設是 ~/whitelist.json，而 blacklist.json 在專案目錄，
+    結果專案裡那份 whitelist.json 根本不會被讀到 —— 改了也沒反應，很難排查。
+    """
+    raw = os.path.expanduser((os.getenv(name) or default).strip())
+    path = Path(raw)
+    return str(path if path.is_absolute() else BASE_DIR / path)
+
+
+WHITELIST_FILE = _data_path("WHITELIST_FILE", "whitelist.json")
+BLACKLIST_FILE = _data_path("BLACKLIST_FILE", "blacklist.json")
 CONFIG_FILE = os.path.expanduser(os.getenv("BRIDGE_CONFIG_FILE", "~/bridge_config.json"))
 # 這個檔案存在代表「這次是使用者主動停的」，run_bot.bat 看到就不要自動重啟
 STOP_FLAG = BASE_DIR / "bot_stop.flag"
