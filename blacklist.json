@@ -1,23 +1,27 @@
 {
-  "CausedDawn1161": {
-    "name": "CausedDawn1161",
-    "reason": "TP 平台中繼帳號",
-    "until": null,
-    "by": "manual",
-    "ts": 1794030416032
-  },
-  "TiptoeGnat3531": {
-    "name": "TiptoeGnat3531",
-    "reason": "TP 平台中繼帳號",
-    "until": null,
-    "by": "manual",
-    "ts": 1794030416032
-  },
-  "TannerOne3240": {
-    "name": "TannerOne3240",
-    "reason": "TP 平台中繼帳號",
-    "until": null,
-    "by": "manual",
-    "ts": 1794030416032
-  }
+    "causeddawn1161": {
+        "name": "CausedDawn1161",
+        "reason": "TP 平台中繼帳號",
+        "until": null,
+        "by": "manual",
+        "ts": 1794030416032
+    },
+    "tannerone3240": {
+        "name": "TannerOne3240",
+        "reason": "TP 平台中繼帳號",
+        "until": null,
+        "by": ".tangkent3"
+    },
+    "tiptoegnat3531": {
+        "name": "TiptoeGnat3531",
+        "reason": "TP 平台中繼帳號",
+        "until": null,
+        "by": ".tangkent3"
+    },
+    "earnedloki5289": {
+        "name": "EarnedLoki5289",
+        "reason": "TP 平台中繼帳號",
+        "until": null,
+        "by": ".tangkent3"
+    }
 }

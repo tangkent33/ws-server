@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.5.1"
+__version__ = "9.5.2"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -245,6 +245,9 @@ COLOR_CODE = re.compile(r"§.")
 TP_BANNER_MARKERS = (
     "發現全球", "发现全球", "世界列表", "网站查看", "網站查看",
     "无需添加好友", "無需添加好友", "xbox好友", "Xbox好友",
+    # 遊戲自己印的橫幅本身就帶這個網址（tpmultiplayer.xyz），
+    # 所以只要出現就一定不是「有人透過 TP 加入」——真正的加入事件只會給玩家名。
+    "tp multiplayer", "tpmultiplayer",
 )
 
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
@@ -906,7 +909,9 @@ class MCWebSocketServer:
     async def _on_player_message(self, body: dict):
         sender = strip_colors(body.get("sender") or self._player_name(body)).strip()
         message = extract_text(body.get("message") or "")
-        if not sender or not message or is_ui_spam(message):
+        # TP 外掛的橫幅會被 DLL 當成一般聊天送過來（例如「外部: 在TP Multiplayer上發現…」），
+        # 那不是玩家發言，一起擋掉。
+        if not sender or not message or is_ui_spam(message) or is_tp_banner(message):
             return
         if not ENABLE_CHAT:
             return
@@ -1211,6 +1216,9 @@ class MiaaooAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rooms: List[Room] = []
         self._rooms_at: float = 0.0
+        self._accounts: List[Dict[str, Any]] = []     # /v2/account 快取（限流很兇）
+        self._accounts_at: float = 0.0
+        self._accounts_note = ""                       # 取不到時的原因，給 /lianji me 顯示
 
     async def start(self):
         if not self._session or self._session.closed:
@@ -1320,14 +1328,37 @@ class MiaaooAPI:
         return out
 
     # ------------------------------------------------------------ 帳號 / 身分
-    async def list_accounts(self) -> List[Dict[str, Any]]:
-        """GET /v2/account → 中繼帳號清單 [{id, name, canaddfriends}]。"""
+    async def list_accounts(self, force: bool = False) -> List[Dict[str, Any]]:
+        """GET /v2/account → 中繼帳號清單 [{id, name, canaddfriends}]。
+
+        這個端點被 nginx 限流得很兇（常常直接回 HTML 429），所以：
+          - 成功結果快取 120 秒，`/lianji me` 連按也不會一直打
+          - 取不到時**退回上次成功的結果**，不要變成一片空白
+        呼叫端可用 `self._accounts_note` 知道這次是即時資料還是舊的。
+        """
+        now = time.monotonic()
+        if not force and self._accounts and now - self._accounts_at < 120:
+            self._accounts_note = ""
+            return self._accounts
+
         status, data = await self._get("v2/account")
-        if status != 200 or not isinstance(data, list):
-            msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
-            log.warning(f"取得帳號清單失敗: HTTP {status} {msg or data}")
+        if status == 200 and isinstance(data, list):
+            accounts = [a for a in data if isinstance(a, dict)]
+            if accounts:
+                self._accounts = accounts
+                self._accounts_at = now
+                self._accounts_note = ""
+                return accounts
+            self._accounts_note = "API 回空清單"
             return []
-        return [a for a in data if isinstance(a, dict)]
+
+        msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
+        if status == 429:
+            self._accounts_note = "API 限流中（429）"
+        else:
+            self._accounts_note = f"HTTP {status} {msg or ''}".strip()
+        log.warning(f"取得帳號清單失敗: {self._accounts_note}")
+        return self._accounts          # 退回上次成功的結果
 
     async def resolve_addid(self, force: bool = False) -> str:
         """addid = /v2/account 裡 canaddfriends=true 的帳號 id（目前通常 6 或 8）。"""
@@ -2788,8 +2819,9 @@ class DCListener(discord.Client):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
-        ident = await self.miaaoo.resolve_identity(force=True)
+        ident = await self.miaaoo.resolve_identity()
         accounts = await self.miaaoo.list_accounts()
+        note = self.miaaoo._accounts_note      # 429 之類的原因，讓使用者知道是不是舊資料
 
         embed = discord.Embed(title="🔑 我的聯機身分", color=0x3B82F6)
         embed.add_field(name="XUID", value=f"`{ident.get('xuid') or '（取不到）'}`", inline=True)
@@ -2800,10 +2832,13 @@ class DCListener(discord.Client):
             lines = [f"`{a.get('id')}` {a.get('name', '')}"
                      + ("　✅ 可加入" if a.get("canaddfriends") else "　⛔ 不可加入")
                      for a in accounts]
-            embed.add_field(name="中繼帳號（/v2/account）",
-                            value=_clip("\n".join(lines), 1000), inline=False)
+            title = "中繼帳號（/v2/account）"
+            if note:
+                title += f" · {note}，以下為上次結果"
+            embed.add_field(name=title, value=_clip("\n".join(lines), 1000), inline=False)
         else:
-            embed.add_field(name="中繼帳號", value="取不到（可能被限流，稍後再試）", inline=False)
+            embed.add_field(name="中繼帳號",
+                            value=f"取不到（{note or 'API 沒回資料'}），稍後再試", inline=False)
 
         if not MC_XUID:
             embed.set_footer(text="想固定 XUID？在 .env 設 MC_XUID=你的16位XUID，就不必每次查 /profile")

@@ -26,7 +26,7 @@
 | `PlayerLeave` | `X 離開了遊戲` | ❌ **X** 離開了遊戲 |
 | `PlayerDied` | `X 被 Y 殺死了` / `X 被 Y 砸爛了` / `X kill by Y` / `X death!` | 💀 … |
 | `PlayerBan` | `玩家xuid … 已被封禁` | 🔨 封禁事件 |
-| `TP_DETECT` | `tpmultiplayer.xyz` 等 | 🛑 TP 平台特徵 |
+| `TP_DETECT` | 舊版的網域特徵 | ⛔ v9.5.2 起 DLL 不再產生（那是遊戲自己的橫幅） |
 | `TP_JOIN` | `玩家嘗試加入 => 名稱:xxx PFID:…` / `try connect: xxx` | 🛑 偵測到 TP 拉人 → **自動踢出** |
 | `KickResult` | 指令執行結果回報 | 失敗才寫 Discord |
 | `BridgeStatus` | DLL 心跳 | 只寫 console（debug 等級） |
@@ -123,7 +123,7 @@ py -3 bot.py --stop
 - 補送前會確認那個人**還在線上**；已經離開的不再執行（否則遊戲會回「沒有與選擇器匹配的目標」）
 - 想立刻生效：確認遊戲端 WebSocket 已連上（`/status` 看「遊戲 WebSocket」是否 🟢）
 
-## TP 偵測的誤判防護（v9.3）
+## TP 偵測的誤判防護（v9.3 → v9.5.2 重做）
 
 TP Multiplayer 外掛自己會在聊天欄印橫幅：
 
@@ -133,16 +133,19 @@ TP Multiplayer 外掛自己會在聊天欄印橫幅：
   tpmultiplayer.xyz
 ```
 
-這段以前被當成「偵測到 TP 平台特徵」而狂刷 Discord，尾巴的二進位噪聲
-（`tpmultiplayer.d`、`tpmultiplayer.x8`…）還讓去重失效。現在三層擋：
+**關鍵事實：`tpmultiplayer.xyz` 這個網址本來就印在橫幅上。**
+所以「看到網域」永遠不代表有人透過 TP 進來 —— 舊版拿網域當特徵，每次橫幅刷新就誤報一次，
+還會拿橫幅裡的垃圾名字去踢「不存在的玩家」（遊戲回「沒有與選擇器匹配的目標」）。
+
+現在的分工：
 
 | 位置 | 規則 |
 | --- | --- |
-| DLL `analysis.cpp` | 含「發現全球 / 世界列表 / 网站查看 / xbox好友」的整行直接丟棄；網域只認 `tpmultiplayer.xyz`，其餘碎片丟棄 |
-| DLL `TPJOIN` | 名字必須 3~16 位英數/底線，含 `tpmultiplayer` 的直接丟棄 |
-| bot `bot.py` | `is_tp_banner()` 再擋一次；提示以「去掉括號內容」為鍵做 180 秒節流；`valid_player_name()` 擋掉垃圾名字，**不合格的連踢都不會排隊** |
+| DLL `analysis.cpp` | `TP` 分類（來自 `tpmultiplayer` / `TP Multiplayer` 字樣）**一律靜默丟棄，不發任何事件**；橫幅尾巴的二進位噪聲也不會再造成洗頻 |
+| DLL `TPJOIN` | 只有 `try connect: <名字>` 與 `玩家嘗試加入 => 名稱:X PFID:Y` 兩條錨點才算數；名字必須 3~16 位英數/底線，含 `tpmultiplayer` 的丟棄 |
+| bot `bot.py` | `is_tp_banner()` 再擋一次（含 `tp multiplayer` / `tpmultiplayer` 字樣即判定為橫幅）；`_on_player_message` 也會擋，橫幅不會再被當成玩家發言轉發 |
 
-真正的加入告警仍走 `try connect: <名字>` / `玩家嘗試加入 => 名稱:…` 兩條錨點。
+也就是說：**TP 告警的唯一來源是「真的有人嘗試加入」**，不是螢幕上出現了什麼字。
 
 ## 已知限制
 - Discord → 遊戲的訊息 / 指令走**遊戲端 WebSocket**（`/connect ws://127.0.0.1:8000`）。

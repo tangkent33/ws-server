@@ -240,7 +240,9 @@ static void Classify(const std::string& s, Found& f) {
         { u8"離開了遊戲", "LEAVE" }, { u8"离开了游戏", "LEAVE" }, { "left the game", "LEAVE" },
         { u8"已被封禁", "BAN" }, { u8"被封禁", "BAN" }, { "has been banned", "BAN" },
         { "tpmultiplayer", "TP" }, { "TP Multiplayer", "TP" },
-        { "try connect:", "TPJOIN" },
+        // TPJOIN 兩種格式：try connect: 名字 / 玩家嘗試加入 => 名稱:X PFID:Y
+        // 用 PFID 當錨點（比「名稱:」獨特得多，不會被玩家資訊面板誤觸）
+        { "try connect:", "TPJOIN" }, { "PFID:", "TPJOIN" },
         // 死亡訊息（中文/英文/伺服器自訂），順序由具體到寬鬆
         { " kill by ", "DEATH" }, { " death!", "DEATH" }, { u8" 死了", "DEATH" },
     };
@@ -413,35 +415,16 @@ void HandleWindow(const char* win, size_t len, const char* tag, bool worldCtx) {
     }
 
     if (f.type == "TP") {
-        // 外掛自己在聊天欄印的說明文字，不是有人加入：
+        // 這裡的每一行都是「遊戲 / 外掛自己印的橫幅」，不是有人加入：
         //   * 外部 在 TP Multiplayer 上發現全球所有xbox好友的世界
         //     在网站查看世界列表，无需添加好友即可加入
-        // 每一行尾巴還會黏到不同的記憶體噪聲，去重鍵跟著變 → 整排洗頻。
-        if (line.find(u8"發現全球") != std::string::npos ||
-            line.find(u8"发现全球") != std::string::npos ||
-            line.find(u8"世界列表") != std::string::npos ||
-            line.find(u8"网站查看") != std::string::npos ||
-            line.find(u8"網站查看") != std::string::npos ||
-            line.find(u8"无需添加好友") != std::string::npos ||
-            line.find(u8"無需添加好友") != std::string::npos ||
-            line.find(u8"xbox好友") != std::string::npos ||
-            line.find(u8"Xbox好友") != std::string::npos) {
-            return;
-        }
-
-        std::string low = line;
-        for (auto& ch : low) ch = (char)tolower((unsigned char)ch);
-        size_t x = low.find("tpmultiplayer");
-        if (x == std::string::npos) return;
-
-        // 只認正式網域。記憶體碎片常被截成 "tpmultiplayer.d"、"tpmultiplayer.x8"，
-        // 這些既不合法、每次又都不一樣，會讓去重失效。
-        static const char kDomain[] = "tpmultiplayer.xyz";
-        const size_t kLen = sizeof(kDomain) - 1;
-        if (low.compare(x, kLen, kDomain) != 0) return;
-
-        if (Duplicate("TP|" + std::string(kDomain))) return;
-        SendLine("TP|TP Multiplayer (" + std::string(kDomain) + u8")");
+        //     tpmultiplayer.xyz
+        // 關鍵：tpmultiplayer.xyz 這個網址本來就印在橫幅上，所以「看到網域」永遠
+        // 不代表有人透過 TP 進來。以前靠網域判斷 → 每次刷新都誤報一次，
+        // 還會被當成「偵測到入侵」去踢不存在的玩家。
+        // 真正的加入偵測走上面的 TPJOIN（try connect: / PFID:），那才是玩家名。
+        (void)line;
+        return;
     }
 }
 
