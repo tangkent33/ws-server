@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.11"
+__version__ = "9.7.12"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -2483,6 +2483,11 @@ class DCListener(discord.Client):
             self._warn_empty_content(message)
             return
 
+        # `.eat @玩家`：把被 @ 的玩家在遊戲裡 kill 掉（權限在 _cmd_eat 內檢查）
+        if content.lower().startswith(".eat"):
+            await self._cmd_eat(message)
+            return
+
         # 指令不受頻道白名單限制（權限在各指令內部檢查），避免「打了沒反應」
         if content.startswith(COMMAND_PREFIX):
             await self._handle_command(message)
@@ -2908,6 +2913,20 @@ class DCListener(discord.Client):
             return "（名字不像玩家，已忽略）"
         cmd = f'kick "{player}" §c{reason}'
         return await self.send_game_command(cmd, f"踢出 {player}（{reason}）", player=player)
+
+    async def kill_player(self, player: str) -> str:
+        """在遊戲裡 kill 一個玩家（`.eat @玩家` 用的）。"""
+        if not ENABLE_COMMAND:
+            log.warning("ENABLE_COMMAND=false，略過 kill")
+            return "（指令傳送已停用）"
+        if is_platform_inviter(player):
+            log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不執行 kill")
+            return "（miaaoo 邀請帳號，已跳過）"
+        if not valid_player_name(player):
+            log.warning(f"🚫 拒絕 kill 不合法的名字: {player[:32]!r}")
+            return "（名字不像玩家，已忽略）"
+        cmd = f'kill "{player}"'
+        return await self.send_game_command(cmd, f"kill {player}", player=player)
 
     async def _deferred_worker(self):
         """等遊戲 WebSocket 連上後，依序補送排隊的指令。"""
@@ -3708,6 +3727,28 @@ class DCListener(discord.Client):
             await status.edit(content="⚠️ 執行失敗（指令無回應）")
         else:
             await status.edit(content=f"📋 結果：\n```\n{_clip(result, 1800)}\n```")
+
+    async def _cmd_eat(self, message: discord.Message):
+        """`.eat @玩家` → 把被 @ 的玩家在遊戲裡 kill 掉。
+
+        Discord 的 @ 對應到誰，用「暱稱(display_name) == 遊戲名」來認，
+        所以要 kill 誰，就先 @ 那個跟遊戲同名的成員。
+        """
+        if not self._check_perm(message):
+            await message.reply("❌ 你沒有權限")
+            return
+        mentions = message.mentions
+        if not mentions:
+            await message.reply("用法：`.eat @玩家`（要 @ 一個人；Discord 暱稱需等於遊戲名）")
+            return
+        results = []
+        for m in mentions:
+            name = (m.display_name or m.name or "").strip()
+            if not name:
+                continue
+            result = await self.kill_player(name)
+            results.append(f"💀 **{name}**：{result}")
+        await message.reply("\n".join(results) if results else "❌ 沒抓到要 kill 的玩家")
 
     async def _cmd_invite(self, message: discord.Message):
         if not self._authorized(message.author):
