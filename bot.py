@@ -859,11 +859,17 @@ class MCWebSocketServer:
             return
 
         header = data.get("header") or {}
-        event = header.get("eventName") or data.get("eventName") or ""
-        purpose = header.get("messagePurpose", "")
         body = data.get("body") or {}
         if not isinstance(body, dict):
             body = {}
+        # PlayerMessage 事件的 eventName 有兩種位置：
+        #   舊版 / DLL 橋接器 → header.eventName
+        #   新版 Bedrock → body.eventName（header 只剩 messagePurpose: event）
+        # 兩種都要吃，否則新版遊戲本體送的聊天會被當成「沒事件」直接丟掉。
+        event = (header.get("eventName")
+                 or body.get("eventName")
+                 or data.get("eventName") or "")
+        purpose = header.get("messagePurpose", "")
 
         if event == "BridgeHello":
             self._bridge_ws = ws
@@ -918,7 +924,11 @@ class MCWebSocketServer:
         player = body.get("player")
         if isinstance(player, dict):
             player = player.get("name") or ""
-        payload = body.get("message") or body.get("sender") or body.get("commandLine") or ""
+        props = body.get("properties")
+        props = props if isinstance(props, dict) else {}
+        payload = (body.get("message") or body.get("sender")
+                   or props.get("Message") or props.get("Sender")
+                   or body.get("commandLine") or "")
         return f"{event}|{player or ''}|{payload}"
 
     def _duplicated(self, event: str, body: dict) -> bool:
@@ -990,8 +1000,16 @@ class MCWebSocketServer:
         return str(player or "")
 
     async def _on_player_message(self, body: dict):
-        sender = strip_colors(body.get("sender") or self._player_name(body)).strip()
-        message = extract_text(body.get("message") or "")
+        # PlayerMessage 有兩種 body 格式：
+        #   舊版 / DLL 橋接器 → body.sender / body.message
+        #   新版 Bedrock       → body.properties.Sender / body.properties.Message
+        # 新版還可能把 message 包成 rawtext JSON，這裡一併兼容。
+        props = body.get("properties")
+        props = props if isinstance(props, dict) else {}
+        sender = strip_colors(
+            body.get("sender") or props.get("Sender") or self._player_name(body)).strip()
+        raw_message = body.get("message") or props.get("Message") or ""
+        message = extract_text(raw_message)
         # TP 外掛的橫幅會被 DLL 當成一般聊天送過來（例如「外部: 在TP Multiplayer上發現…」），
         # 那不是玩家發言，一起擋掉。
         if not sender or not message or is_ui_spam(message) or is_tp_banner(message):
