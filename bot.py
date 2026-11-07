@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 r"""Discord ⇄ Minecraft 橋接程式（單檔版）。
 
 原本拆在 bridge/ 套件裡的模組（config / jsonstore / textutil / mcws /
@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.1"
+__version__ = "9.7.2"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -1571,6 +1571,89 @@ class RoomPaginator(discord.ui.View):
             self._refresh_buttons()
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
 
+# ------------------------------------------------------------------ 外部封禁紀錄統計
+# 狀態列的「封禁系統已封禁 N 名玩家」。服務位址與永久 Token 全部從 .env 讀
+# （BAN_RECORDS_API_BASE / BAN_RECORDS_TOKEN），程式裡不寫死任何服務位址；
+# 沒填就整組停用。/list 回傳的是「紀錄」列表，同一個玩家可能有多筆，所以這裡
+# 統計的是「不重複的 playerName 數」。
+class BanRecordsCounter:
+    CACHE_TTL = 300.0            # 5 分鐘，別每次刷新狀態列都打一次
+
+    def __init__(self):
+        self.base = (os.getenv("BAN_RECORDS_API_BASE") or "").rstrip("/")
+        self.token = (os.getenv("BAN_RECORDS_TOKEN") or "").strip()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._count: Optional[int] = None      # None = 還沒查到過
+        self._note = ""
+        self._at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base and self.token)
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10, connect=5),
+                headers={"Authorization": f"Bearer {self.token}",
+                         "User-Agent": f"mc-bridge/{__version__}"})
+        return self._session
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def count(self, force: bool = False) -> Tuple[Optional[int], str]:
+        """回傳 (不重複玩家數或 None, 最近一次失敗說明)。失敗時退回上次的數字。"""
+        if not self.enabled:
+            return None, "未設定 BAN_RECORDS_API_BASE / BAN_RECORDS_TOKEN"
+        now = time.monotonic()
+        if not force and self._count is not None and now - self._at < self.CACHE_TTL:
+            return self._count, ""
+
+        session = await self._ensure_session()
+        status = 0
+        try:
+            async with session.get(self.base + "/list") as resp:
+                status = resp.status
+                text = await resp.text()
+        except asyncio.TimeoutError:
+            self._note = "請求逾時"
+            return self._count, self._note
+        except aiohttp.ClientError as exc:
+            self._note = f"連線失敗：{exc}"
+            return self._count, self._note
+
+        try:
+            data = json.loads(text)
+        except ValueError:
+            self._note = f"HTTP {status} 非 JSON"
+            return self._count, self._note
+
+        items: List[Any] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list):
+                    items = value
+                    break
+        if status != 200:
+            msg = data.get("message") if isinstance(data, dict) else ""
+            self._note = f"HTTP {status}{('：' + str(msg)) if msg else ''}"
+            return self._count, self._note
+
+        names = {str(r.get("playerName") or "").strip().lower()
+                 for r in items if isinstance(r, dict)}
+        names.discard("")
+        self._count = len(names)
+        self._at = now
+        self._note = ""
+        log.info(f"🛡 封禁紀錄統計更新：{self._count} 名玩家")
+        return self._count, ""
+
+
 class StatusBoard:
     """一條會自己刷新的伺服器狀態列（一行式）。
 
@@ -1658,12 +1741,22 @@ class StatusBoard:
             log.info(f"📊 狀態列 seed：遊戲回報 {online}/{self._max_players} 人")
 
     # ------------------------------------------------ 動作
+    async def _records_segment(self) -> str:
+        """「🛡 封禁系統已封禁 N 名玩家」：只在外部紀錄源連上時才顯示。"""
+        counter = getattr(self.client, "ban_records", None)
+        if counter is None or not counter.enabled:
+            return ""
+        count, _note = await counter.count()
+        if count is None:
+            return ""                     # 沒連上就不顯示，避免狀態列一直報錯
+        return f" ｜ 🛡 封禁系統已封禁 **{count}** 名玩家"
+
     async def refresh(self) -> str:
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
             return "（找不到頻道）"
 
-        text = self.render()
+        text = self.render() + await self._records_segment()
 
         if self.message_id:
             try:
@@ -1793,6 +1886,7 @@ class DCListener(discord.Client):
         self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
         self.board = StatusBoard(self)             # 一行式狀態列
+        self.ban_records = BanRecordsCounter()     # 外部封禁紀錄統計（狀態列顯示人數）
         self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
         self._closing = False                      # close() 進來過就別再進來
         self._handlers: Dict[str, Callable] = {
@@ -1944,6 +2038,11 @@ class DCListener(discord.Client):
             await self.board.stop(delete_message=False)
         except Exception as exc:
             log.warning(f"停止狀態列失敗: {exc}")
+
+        try:
+            await self.ban_records.close()
+        except Exception:
+            pass
 
         if self._deferred_task and not self._deferred_task.done():
             self._deferred_task.cancel()
