@@ -19,6 +19,12 @@
 #pragma execution_character_set("utf-8")
 #pragma comment(lib, "user32.lib")
 
+// 版本戳：DLL 啟動時會把自己的版本報給橋接器（SYS|dll_ready|<BUILD_ID>）。
+// 遊戲開久了記憶體裡會同時存在好幾份舊版 DLL（每次注入的檔名都不同 → 不會被覆蓋），
+// 舊版會繼續送舊格式事件（例如把 TP 橫幅印成「TP Multiplayer (tpmultiplayer1mj)」）。
+// 有這個戳記，橋接器就能直接告訴你「現在講話的是舊版，請重開遊戲」。
+#define BUILD_ID "10.1"
+
 // ---------------------------------------------------------------- 共用型別
 struct Found {
     std::string type;

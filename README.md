@@ -222,6 +222,19 @@ TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 加入成功後**不會**產生任何邀請網址——後端是先把你的帳號加進該帳號的粉絲、再發 Xbox 邀請，
 所以正確做法是：開遊戲 → `世界` 分頁 → 重新整理 → 點房間卡片加入。
 
+## 上傳 GitHub 的內容（隱私）
+
+倉庫裡**不會**出現這些東西：
+
+| 檔案 | 狀態 |
+| --- | --- |
+| `.env` | 不上傳。倉庫只放 `.env.example`（Token / Webhook / XUID / API Key 全部留空），要用時複製成 `.env` 再填 |
+| `.gitignore`、`push.bat`、`pull.bat` | 只留在本機，不進版本庫 |
+| `whitelist.json`、`blacklist.json` | 倉庫裡是空殼 `{}`；本機真實內容靠 `git update-index --skip-worktree` 保護，不會被 push 上去 |
+
+> `skip-worktree` 的效果就是「git 假裝這兩個檔案沒改過」，所以 `git status` 看不到它們的變動（正常）。
+> 要臨時取消保護：`git update-index --no-skip-worktree whitelist.json blacklist.json`
+
 ## 資料檔位置
 
 ```
@@ -284,3 +297,23 @@ Minecraft.Windows.exe
         ▼
      MC-WS.exe  ──  ws://127.0.0.1:8000  ──►  bot.py  ──►  Discord
 ```
+
+## v9.7 修了什麼（重啟後「dc↔mc 全斷」的那次）
+
+1. **重啟後 40 秒才上線 → 這段時間的事件全部消失**
+   以前 `setup_hook()` 會先 `await tree.sync()` 清全域指令，這一步撞到 Discord
+   限流要等 30~60 秒，而 `setup_hook` 是在 gateway 連線**之前**跑的，
+   結果 bot 根本還沒登入，畫面上卻已經看到 `++ 玩家加入了遊戲`。
+   → 改成登入後才在背景清（用一棵空的獨立指令樹，不動本地樹），登入時間回到 1~2 秒。
+2. **登入前收到的事件先暫存**：`_send_to_discord` 在 `is_ready()` 之前不再默默丟掉，
+   而是存進緩衝（上限 40 則 / 3 分鐘），`on_ready` 時補發。
+3. **加入 / 離開的玩家名被截斷**（`gx`、`c_`、`gZs`、`pinyq _ _`）
+   DLL 掃描時原本固定往回吃 200 位元組，字串比這更長就會從名字中間開始。
+   → 改成往回找到「上一條字串的 NUL」再取，並且要求名字 3 字元以上、
+   每個片段至少 2 字元、不含 `tpmultiplayer`。bot 端也再驗一次。
+4. **TP 橫幅刷屏**（`!! [TP] TP Multiplayer (tpmultiplayer1mj)`）
+   這是**舊版 DLL 殘留在遊戲記憶體裡**繼續吐舊格式事件（每次注入的檔名都不同，
+   舊模組不會被覆蓋）。新版 DLL 對 `type == TP` 整段靜默丟棄，
+   而且啟動時會回報版本：`[sys] dll_ready（v10.1）`。
+   若看到 `[!] DLL 沒有回報版本` 就是舊版還在講話 → 關掉 Minecraft 再重開，
+   之後重跑 `start.bat`（舊版約 2 分鐘沒人聽就會自己停下來）。

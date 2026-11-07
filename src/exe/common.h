@@ -19,6 +19,10 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// 必須和 src/dll/common.h 的 BUILD_ID 一致；DLL 報上來的版本不同就代表
+// 遊戲裡跑的是舊版 DLL（舊 DLL 會繼續吐舊格式事件），要重開遊戲。
+#define BUILD_ID "10.1"
+
 // ---------------------------------------------------------------- 常數
 extern const wchar_t* PROCESS_NAME;
 extern const wchar_t* DLL_NAME;

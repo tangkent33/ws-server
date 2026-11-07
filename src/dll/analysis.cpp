@@ -205,6 +205,9 @@ static std::string NameBefore(const std::string& text) {
         if (c < 0x80 && !(isalnum(c) || c == '_' || c == '-')) break;
         if (c >= 0x80) { start--; continue; }   // 中文名
         start--;
+        // gamertag 上限 16；抓超過 24 個字元代表這個「名字」其實是一長串
+        // 黏在一起的記憶體（中間沒有 NUL），再抓下去只會生出垃圾名。
+        if (end - start > 24) return "";
     }
     std::string name = Trim(t.substr(start, end - start));
 
@@ -270,6 +273,17 @@ static void Classify(const std::string& s, Found& f) {
             }
             f.a = NameBefore(s.substr(0, p));
             if (f.a.empty() || !NameOk(f.a)) { f.type.clear(); continue; }
+            if (f.type == "JOIN" || f.type == "LEAVE") {
+                // 加入/離開事件一定要是「完整、像樣的 gamertag」：
+                //   * 3~16 字元、每個片段至少 2 字元（ChatNameOk）
+                //   * 不含 tpmultiplayer（那是外掛橫幅被切下來的碎片）
+                // 舊版只要求 2 字元，於是記憶體碎片 "gx" / "c_" / "ys"
+                // 全部被當成「有人加入」送到 Discord。
+                if (!ChatNameOk(f.a)) { f.type.clear(); continue; }
+                std::string lowered = f.a;
+                for (auto& ch : lowered) ch = (char)tolower((unsigned char)ch);
+                if (lowered.find("tpmultiplayer") != std::string::npos) { f.type.clear(); continue; }
+            }
             if (f.type == "DEATH") {
                 if (!DeathNameOk(f.a)) { f.type.clear(); continue; }
                 f.b = s;

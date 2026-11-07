@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.6.0"
+__version__ = "9.7.0"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -200,6 +200,8 @@ DEFAULT_AUTHORIZED = [
 
 # ------------------------------------------------------------------ 執行期常數
 DEDUP_WINDOW = 5.0            # 秒：兩個來源可能送同一件事
+DC_BUFFER_TTL = 180.0         # 秒：Discord 還沒登入時暫存的事件最多留 3 分鐘
+DC_BUFFER_MAX = 40            # 暫存上限，避免剛開機就被洗版
 MAX_MESSAGE = 1900            # Discord 單則訊息上限 2000，留點邊界
 LOCK_PORT = 27999             # 單一實例鎖
 COMMAND_PREFIX = "!"
@@ -290,6 +292,28 @@ def valid_player_name(name: str) -> bool:
     if "tpmultiplayer" in name.lower():
         return False
     return True
+
+
+def looks_like_player_name(name: str) -> bool:
+    """加入 / 離開事件用的寬鬆版（允許含空格的 gamertag）。
+
+    基岩版的 gamertag 最少 3 個字元，所以 "gx"、"ys"、"c_"、"gZs"
+    這種 2~3 字元的片段一定是掃描切壞的記憶體碎片，不該當成有人加入。
+    但 "Bad Tooth4274" 這種帶空格的正常名字要放行。
+    """
+    name = str(name or "").strip()
+    if not name or "tpmultiplayer" in name.lower():
+        return False
+    if PLAYER_NAME_RE.match(name):
+        return True
+    if "  " in name:
+        return False                      # 連續空白 → 碎片
+    parts = name.split(" ")
+    if not 1 <= len(parts) <= 3 or any(len(p) < 2 for p in parts):
+        return False
+    if not all(re.fullmatch(r"[A-Za-z0-9_]+", p) for p in parts):
+        return False
+    return 3 <= sum(len(p) for p in parts) <= 16
 
 
 def is_platform_inviter(name: str) -> bool:
@@ -939,6 +963,11 @@ class MCWebSocketServer:
         name = self._player_name(body).strip()
         if not name:
             return
+        # 名字只是記憶體裡的片段（"gx"、"tpmultiplayer1mj"）就不要當成有人加入。
+        # 基岩版 gamertag 最少 3 個字元，2 個字元一定是掃描切壞的碎片。
+        if not looks_like_player_name(name):
+            log.info(f"🚫 忽略不像玩家名的加入事件: {name[:32]!r}")
+            return
         self.players.add(name)
         log.info(f"➕ {name} 加入")
         if ENABLE_JOIN_LEAVE and self.on_join:
@@ -947,6 +976,9 @@ class MCWebSocketServer:
     async def _on_player_leave(self, body: dict):
         name = self._player_name(body).strip()
         if not name:
+            return
+        if not looks_like_player_name(name):
+            log.info(f"🚫 忽略不像玩家名的離開事件: {name[:32]!r}")
             return
         self.players.discard(name)
         log.info(f"➖ {name} 離開")
@@ -1935,6 +1967,9 @@ class DCListener(discord.Client):
         self._tp_alert_at: Dict[str, float] = {}   # TP 提示節流（同一類別幾分鐘只發一次）
         self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
         self._deferred_task: Optional[asyncio.Task] = None
+        self._global_clear_task: Optional[asyncio.Task] = None
+        self._dc_buffer: deque = deque()           # Discord 還沒就緒時暫存的訊息
+        self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
         self.board = StatusBoard(self)             # 一行式狀態列
         self.acz_api = AczAPI()                        # acz.cc.cd 玩家紀錄（沒 token 就自動停用）
@@ -1962,15 +1997,13 @@ class DCListener(discord.Client):
     async def setup_hook(self):
         self.tree.on_error = self.on_tree_error
 
-        # 先把「全域指令」清空：舊版本殘留的全域 /ping 等會造成
-        # CommandSignatureMismatch，而且全域指令更新要等 Discord 快取，
-        # 所以一律改用 guild 指令。
-        self.tree.clear_commands(guild=None)
-        try:
-            await self.tree.sync()
-            log.info("🧹 已清空全域斜線指令，改用 guild 指令")
-        except Exception as exc:
-            log.error(f"清空全域指令失敗: {exc}")
+        # 以前這裡會 await 一次「清空全域指令」的 sync（送一個 bulk overwrite 請求）。
+        # 那個請求碰到 Discord 的 rate limit 時會重試 30~60 秒，而 setup_hook 是在
+        # gateway 連線「之前」跑的 —— 結果就是每次重啟 bot 都要幾十秒才上線，
+        # 這段時間遊戲的加入 / 聊天事件全部被丟掉（畫面上「++ 玩家加入了遊戲」有出現，
+        # Discord 卻什麼都沒有）。現在改成登入後才在背景清，且不動本地指令樹。
+        if self._global_clear_task is None or self._global_clear_task.done():
+            self._global_clear_task = asyncio.create_task(self._clear_global_commands())
 
         for cmd in (self.slash_status, self.slash_ping, self.slash_players,
                     self.slash_check, self.slash_cmd,
@@ -2007,6 +2040,45 @@ class DCListener(discord.Client):
             else:
                 _bind(command)
 
+    async def _clear_global_commands(self):
+        """把 Discord 上殘留的「全域指令」清掉（背景執行，不擋登入）。
+
+        關鍵：用一個**空的獨立指令樹**去 sync，不要動 self.tree。
+        以前是 self.tree.clear_commands(guild=None) + sync()，清完忘了放回去，
+        後面任何一次 copy_global_to(guild) 就會把空清單同步上 guild → 指令整批消失。
+        """
+        await self.wait_until_ready()
+        try:
+            empty = app_commands.CommandTree(self)
+            await asyncio.wait_for(empty.sync(), timeout=25)
+            log.info("🧹 已清空全域斜線指令，改用 guild 指令")
+        except asyncio.TimeoutError:
+            log.warning("⚠️ 清空全域指令逾時（Discord 限流），不影響 guild 指令")
+        except Exception as exc:
+            log.warning(f"清空全域指令失敗: {exc}")
+
+    async def _flush_dc_buffer(self):
+        """把「還沒登入時收到的遊戲事件」補發到 Discord。"""
+        if not self._dc_buffer:
+            return
+        pending = list(self._dc_buffer)
+        self._dc_buffer.clear()
+        sent = 0
+        for created, username, content in pending:
+            if time.monotonic() - created > DC_BUFFER_TTL:
+                continue
+            for cid in dict.fromkeys(self.config.channel_ids):
+                channel = self.get_channel(cid)
+                if not channel:
+                    continue
+                try:
+                    await channel.send(content)
+                    sent += 1
+                except Exception as exc:
+                    log.debug(f"補發到頻道 {cid} 失敗: {exc}")
+        if sent:
+            log.info(f"📮 已補發 {len(pending)} 則離線期間的遊戲事件到 Discord")
+
     async def on_disconnect(self):
         log.warning("⚠️ Discord 連線中斷，準備重連")
 
@@ -2020,6 +2092,9 @@ class DCListener(discord.Client):
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={"User-Agent": f"DiscordBot (mc-bridge {__version__})"},
             )
+        # 把「登入前」收到的遊戲事件補發出去
+        await self._flush_dc_buffer()
+
         # 只同步還沒同步過的伺服器：重連時 on_ready 會再觸發一次，
         # 每次都全量 sync 很容易撞上 Discord 的 rate limit。
         pending = [g for g in self.guilds if g.id not in self._synced_guilds]
@@ -2027,7 +2102,9 @@ class DCListener(discord.Client):
             await self._sync_guild_commands(pending)
 
         # 重啟後接續上次的狀態列（訊息還在就接著改，被刪了就重建）
-        await self.board.resume()
+        if not self._board_started:
+            self._board_started = True
+            await self.board.resume()
 
     async def request_shutdown(self) -> None:
         """主動下線：先移除 Discord 上註冊的斜線指令，再斷線。"""
@@ -2254,6 +2331,16 @@ class DCListener(discord.Client):
     # ------------------------------------------------ 遊戲 → Discord
     async def _send_to_discord(self, username: str, content: str):
         text = _clip(content)
+
+        # 還沒登入完成（重啟後那幾秒）時，get_channel() 一律回 None，
+        # 以前就是這樣把「有人加入 / 有人說話」整批丟掉的。先存起來，登入後補發。
+        if not self.is_ready():
+            self._dc_buffer.append((time.monotonic(), username, text))
+            while len(self._dc_buffer) > DC_BUFFER_MAX:
+                self._dc_buffer.popleft()
+            log.debug(f"Discord 尚未就緒，先暫存: {text[:40]}")
+            return
+
         for cid in dict.fromkeys(self.config.channel_ids):
             channel = self.get_channel(cid)
             if not channel:

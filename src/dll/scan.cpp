@@ -59,6 +59,19 @@ static void ScanChatSegments(const unsigned char* buf, size_t len) {
         if (!Duplicate(payload)) SendLine(payload);
     }
 }
+// 從錨點往回找到「上一條字串的結尾（NUL）」，把掃描窗口對齊真正的字串邊界。
+// 以前固定往回吃 200 位元組，若字串本身比 200 位元組長（很常見：色碼 + 前綴），
+// 視窗就會從名字中間開始 → 玩家名被截斷成 "gx"、"gZs" 這種碎片。
+static size_t BackToNul(const unsigned char* buf, size_t off, size_t maxBack) {
+    size_t lo = off > maxBack ? off - maxBack : 0;
+    size_t i = off;
+    while (i > lo) {
+        if (buf[i - 1] == 0) return i;
+        i--;
+    }
+    return lo;
+}
+
 static void ScanChunk(unsigned long long base, const unsigned char* buf, size_t len) {
     static const char* anchors[] = {
         u8"加入了遊戲", u8"加入了游戏", "joined the game",
@@ -78,8 +91,8 @@ static void ScanChunk(unsigned long long base, const unsigned char* buf, size_t 
             if (!h) break;
             size_t off = (size_t)(h - buf);
             pos = off + 1;
-            size_t b = off > 200 ? off - 200 : 0;
-            size_t e = off + 260 < len ? off + 260 : len;
+            size_t b = BackToNul(buf, off, 800);
+            size_t e = off + 320 < len ? off + 320 : len;
             HandleWindow((const char*)buf + b, e - b, "EVT", worldCtx);
             hit = true;
         }
@@ -131,7 +144,7 @@ DWORD WINAPI ScanThread(LPVOID) {
     size_t coldCursor = 0;
     DWORD lastEnum = 0;
 
-    SendLine("SYS|dll_ready");
+    SendLine(std::string("SYS|dll_ready|") + BUILD_ID);
 
     while (true) {
         DWORD now = GetTickCount();

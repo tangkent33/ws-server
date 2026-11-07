@@ -73,6 +73,28 @@ void HandleEventLine(const std::string& line) {
         SendEvent("KickResult", "{\"message\":\"" + EscapeJson(a + "|" + b) + "\"}");
     } else if (type == "SYS") {
         if (a == "ping") return;
+
+        if (a == "dll_ready") {
+            // b = DLL 的版本戳。空白 = 遊戲裡跑的是「沒有戳記」的舊版 DLL；
+            // 與本體不同 = 剛 rebuild，但遊戲記憶體裡還是舊的那份。
+            if (b.empty()) {
+                SetColor(C_RED);
+                printf("[!] DLL 沒有回報版本 → 遊戲裡幾乎確定是舊版 DLL 殘留\n");
+                printf("    舊版會把 TP 橫幅切成 \"tpmultiplayer1mj\" 這種假玩家名，\n");
+                printf("    也會把加入事件的玩家名截斷。請關掉 Minecraft 再重開，然後重跑 start.bat\n");
+                SetColor(C_RESET);
+            } else if (b != BUILD_ID) {
+                SetColor(C_RED);
+                printf("[!] DLL 版本 %s 與橋接器版本 %s 不同，事件格式可能不相容\n", b.c_str(), BUILD_ID);
+                printf("    請關掉 Minecraft 再重開，然後重跑 start.bat\n");
+                SetColor(C_RESET);
+            } else {
+                SetColor(C_GREEN); printf("[sys] dll_ready（v%s）\n", b.c_str()); SetColor(C_RESET);
+            }
+            SendEvent("BridgeStatus", "{\"message\":\"" + EscapeJson(a + (b.empty() ? "" : "|" + b)) + "\"}");
+            return;
+        }
+
         SetColor(C_GRAY); printf("[sys] %s\n", a.c_str()); SetColor(C_RESET);
         SendEvent("BridgeStatus", "{\"message\":\"" + EscapeJson(a) + "\"}");
     }
