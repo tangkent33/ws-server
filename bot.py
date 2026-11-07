@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.5"
+__version__ = "9.7.6"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -341,13 +341,33 @@ def first_token(cmd: str) -> str:
 
 def extract_players(raw: str) -> List[str]:
     """從 `list` 指令的回覆抓玩家名。"""
-    if not raw:
+    if not raw or looks_like_no_world(raw):
         return []
-    match = re.search(r"(?:玩家在線|Players online)\s*[:：]?\s*\n?\s*(.+)", raw, re.IGNORECASE)
+    match = re.search(r"(?:玩家在線|線上玩家|Players online)[^:：\n]*[:：]\s*(.+)",
+                      raw, re.IGNORECASE)
     tail = match.group(1).strip() if match else raw.strip()
     if not tail or tail in ("0", "無"):
         return []
     return [x.strip() for x in tail.split(",") if x.strip()]
+
+
+_NO_WORLD_MARKERS = (
+    "未知的命令", "未知的指令", "無法辨識的命令", "命令不存在",
+    "unknown command", "unknown or incomplete command",
+    "syntax error: unexpected",
+)
+
+
+def looks_like_no_world(text: str) -> bool:
+    """遊戲回「未知的命令」＝現在不在任何世界裡（房間已關 / 還沒進世界）。
+
+    這是目前唯一可靠的判準：MC-WS.exe 只要還開著，WebSocket 就一直連著，
+    所以「橋接器有連線」≠「人在世界裡」。離開世界後所有指令都會被遊戲
+    以「未知的命令」拒絕（連 `list` / `time query` 都一樣）。
+    """
+    low = str(text or "").lower()
+    return any(m in low for m in _NO_WORLD_MARKERS)
+
 
 # ------------------------------------------------------------------ 狀態列用的格式化
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -1736,6 +1756,9 @@ class StatusBoard:
         return max(0.0, time.time() - base)
 
     def render(self) -> str:
+        if getattr(self.client, "_in_world", None) is False:
+            return (f"⚪ **未進入世界 / 指令不可用**（房間已關或世界沒開指令） ｜ "
+                    f"最近更新時間: {cn_stamp()}")
         online = len(self.client.mc.players)
         joined = len(self.client._seen_players)
         dot = "🟢" if self.client.mc.game_clients() else "🔴"
@@ -1753,6 +1776,9 @@ class StatusBoard:
                 await self.client.mc.send_command("list", timeout=6))
         except Exception as exc:
             log.debug(f"狀態列 seed 失敗: {exc}")
+            return
+        if looks_like_no_world(raw):
+            self.client._in_world = False
             return
         online, cap = parse_list_counts(raw)
         if cap:
@@ -1912,6 +1938,7 @@ class DCListener(discord.Client):
         self._dc_buffer: deque = deque()           # Discord 還沒就緒時暫存的訊息
         self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
+        self._in_world: Optional[bool] = None      # 在不在世界裡（None=還沒判斷）
         self._list_miss: Dict[str, int] = {}       # list 對帳：連續幾次沒看到這個人
         self._announced_at: Dict[str, float] = {}  # 剛被 DLL 報過的人，list 不重複報
         self._suppress_until: float = 0.0          # 換房間後先靜默填名單，不刷「加入了遊戲」
@@ -2332,6 +2359,18 @@ class DCListener(discord.Client):
                     continue
                 raw = await self.mc.send_command("list", timeout=8)
                 text = self._clean_result(raw or "")
+                if text and looks_like_no_world(text):
+                    # 房間關了：清掉殘留名單，狀態列改成「未進入世界」
+                    if self._in_world is not False:
+                        self._in_world = False
+                        self.mc.players.clear()
+                        self._list_miss.clear()
+                        log.info("🏠 遊戲回報「未知的命令」→ 已離開世界（房間已關閉）")
+                    continue
+                if text:
+                    if self._in_world is not True:
+                        self._in_world = True
+                        log.info("🏠 偵測到有效的 list 回覆 → 已進入世界")
                 names = [n for n in extract_players(text) if looks_like_player_name(n)]
                 if not names:
                     # 沒回顯（非房主 / 指令被擋 / 世界剛載入）→ 10 分鐘提醒一次
@@ -2784,6 +2823,25 @@ class DCListener(discord.Client):
         )
         list_raw, time_raw, weather_raw, seed_raw = (self._clean_result(r) for r in results)
         players = extract_players(list_raw)
+
+        # 房間關掉以後，MC-WS 的 WebSocket 還連著（它不管你在不在世界裡），但遊戲
+        # 會把每一個指令都用「未知的命令」打回來 —— 用這個判斷在不在世界裡，
+        # 比看連線狀態準得多。
+        no_world = any(looks_like_no_world(t)
+                       for t in (list_raw, time_raw, weather_raw, seed_raw) if t)
+        if no_world:
+            self._in_world = False
+            embed = discord.Embed(
+                title="🔴 遊戲世界未就緒",
+                description="遊戲對 `list` / `time` / `weather` / `seed` 全回「未知的命令」。\n"
+                            "通常是**房間已經關掉**或**還沒進世界**；如果你人在世界裡，"
+                            "那就是那個世界沒開「允許指令」。",
+                color=0xEF4444)
+            embed.add_field(name="🔌 橋接器", value="🟢 已連線（MC-WS 還在跑）", inline=False)
+            embed.add_field(name="🌍 遊戲世界", value="🔴 未進入", inline=False)
+            await interaction.followup.send(embed=embed)
+            return
+        self._in_world = True
 
         embed = discord.Embed(title="📊 伺服器狀態", color=0x3B82F6)
         embed.add_field(name="👥 線上", value=f"{len(players)} 人", inline=True)
