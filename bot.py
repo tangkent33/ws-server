@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.5.2"
+__version__ = "9.5.3"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -137,6 +137,10 @@ TP_KICK = _env_bool("TP_KICK", "true")
 TP_KICK_REASON = os.getenv("TP_KICK_REASON", "偵測到 TP 平台加入")
 TP_KICK_COOLDOWN = _env_int("TP_KICK_COOLDOWN", 20)         # 同一人幾秒內不重複踢
 TP_ALERT_COOLDOWN = _env_int("TP_ALERT_COOLDOWN", 180)      # 同一類 TP 提示幾秒內只發一次
+
+# 「玩家嘗試加入」要不要同時打在遊戲公屏上（走遊戲自己的 WebSocket，不用鍵盤注入）
+TP_ANNOUNCE = _env_bool("TP_ANNOUNCE", "true")
+TP_ANNOUNCE_TEXT = os.getenv("TP_ANNOUNCE_TEXT", "§e[TP] §f玩家嘗試加入：§c{player}")
 
 # 遊戲 WebSocket 沒連線時，指令排隊等連上再送（不再退回鍵盤注入）
 KICK_QUEUE_TTL = _env_int("KICK_QUEUE_TTL", 600)            # 排隊多久還沒連上就作廢（秒）
@@ -1003,6 +1007,32 @@ class MCWebSocketServer:
         cmd = 'tellraw @a {"rawtext":[{"text":%s}]}' % json.dumps(text, ensure_ascii=False)
         return await self.send_command(cmd, timeout=5.0)
 
+    async def tellraw_players(self, text: str) -> bool:
+        """把一行字打在遊戲公屏上（`tellraw @a`），只走「遊戲本體」那條 WebSocket。
+
+        刻意不用 send_command：
+          - 播報不需要等回顯，等 5 秒只會拖住 TP 事件的處理
+          - send_command 會廣播給**所有**連線，包含橋接器 → 橋接器再讓 DLL 注入鍵盤，
+            同一句話會在公屏出現兩次
+        """
+        if not text:
+            return False
+        clients = self.game_clients()
+        if not clients:
+            return False
+
+        command = 'tellraw @a {"rawtext":[{"text":%s}]}' % json.dumps(text, ensure_ascii=False)
+        data = json.dumps(self._new_payload(command), ensure_ascii=False)
+
+        sent = 0
+        for ws in list(clients):
+            try:
+                await ws.send(data)
+                sent += 1
+            except Exception:
+                self._clients.discard(ws)
+        return sent > 0
+
 
 # ============================================================ 5. HTTP 封禁 API
 _bg_tasks: Set[asyncio.Task] = set()
@@ -1770,6 +1800,7 @@ class DCListener(discord.Client):
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
         self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
+        self._tp_announced: Dict[str, float] = {}  # TP 玩家最近一次公屏播報的時間
         self._tp_alert_at: Dict[str, float] = {}   # TP 提示節流（同一類別幾分鐘只發一次）
         self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
         self._deferred_task: Optional[asyncio.Task] = None
@@ -2158,6 +2189,19 @@ class DCListener(discord.Client):
             lines.append("（單向模式：未執行 kick）")
         await self._send_to_discord("防禦系統", "\n".join(lines))
 
+    async def _announce_tp(self, player: str) -> None:
+        """把「玩家嘗試加入」打在遊戲公屏上（讓遊戲裡的人也看得到）。"""
+        text = TP_ANNOUNCE_TEXT.replace("{player}", player)
+        try:
+            ok = await self.mc.tellraw_players(text)
+        except Exception as exc:
+            log.warning(f"公屏播報失敗: {exc}")
+            return
+        if ok:
+            log.info(f"📢 已在公屏播報: {player}")
+        else:
+            log.info(f"📢 遊戲 WebSocket 未連線，略過公屏播報: {player}")
+
     async def on_mc_tp_join(self, player: str):
         """偵測到 TP 平台拉人：報告 + 直接踢出（TP_KICK 可關）。"""
         if is_platform_inviter(player):
@@ -2168,6 +2212,13 @@ class DCListener(discord.Client):
             return
 
         now = time.monotonic()
+
+        # 公屏播報：同一人 8 秒內只播一次（舊 DLL 可能重複送事件）
+        if TP_ANNOUNCE:
+            if now - self._tp_announced.get(player.lower(), 0.0) >= 8:
+                self._tp_announced[player.lower()] = now
+                _spawn(self._announce_tp(player))
+
         last = self._tp_kicked.get(player.lower(), 0)
         if now - last < TP_KICK_COOLDOWN:
             log.debug(f"TP 玩家 {player} 在冷卻期內，略過重複處理")
