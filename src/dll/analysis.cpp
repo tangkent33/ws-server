@@ -297,24 +297,53 @@ static std::string NormalizeKey(const std::string& s) {
     return out;
 }
 
+// 選單 / 教學 / Realm 邀請這些 UI 句子裡也會出現「加入了遊戲」「加入」，
+// 用特徵詞排除，比檢查 worldCtx 可靠（實測 worldCtx 幾乎永遠是 false）。
+static bool LooksLikeUiSentence(const std::string& s) {
+    static const char* kUi[] = {
+        u8"選單", u8"菜单", u8"Realm", u8"邀請", u8"邀请", u8"教學", u8"教学",
+        u8"成就", u8"設定", u8"设定", u8"點擊", u8"点击", "Click", "Tap to",
+        u8"好友的世界", u8"好友的世界和 Realm",
+    };
+    for (const char* k : kUi) {
+        if (s.find(k) != std::string::npos) return true;
+    }
+    return false;
+}
+
 
 // JOIN/LEAVE 專用去重：記憶體裡同一則訊息常被加上不同前綴（"n DeftApollo9066"、"T DeftApollo9066"），
 // 只要新名字「以某個剛出現過的名字結尾」就視為同一件事。
+//
+// 注意：必須把事件類型也算進比對。以前這裡只比名字，結果「某人加入後 2 分鐘內離開」
+// 的 LEAVE 會被當成重複丟掉 → 玩家列表永遠留著已離線的人，狀態列人數也虛高。
 static bool DuplicateByName(const std::string& type, const std::string& name) {
-    static std::vector<std::pair<std::string, DWORD>> recent;
+    struct Recent { std::string type; std::string name; DWORD at; };
+    static std::vector<Recent> recent;
     DWORD now = GetTickCount();
     for (auto it = recent.begin(); it != recent.end(); ) {
-        if (now - it->second > 120000) it = recent.erase(it); else ++it;
+        if (now - it->at > 120000) it = recent.erase(it); else ++it;
     }
     for (auto& r : recent) {
-        if (r.first == name) return true;
-        if (name.size() > r.first.size() + 1 &&
-            name.compare(name.size() - r.first.size(), r.first.size(), r.first) == 0) return true;
+        if (r.type != type) continue;              // JOIN / LEAVE / DEATH 各自獨立
+        if (r.name == name) return true;
+        if (name.size() > r.name.size() + 1 &&
+            name.compare(name.size() - r.name.size(), r.name.size(), r.name) == 0) return true;
         // 反向：舊名字是新名字的尾段（記憶體裡常被截頭，例如 teelhand34 / hand34）
-        if (r.first.size() > name.size() + 1 &&
-            r.first.compare(r.first.size() - name.size(), name.size(), name) == 0) return true;
+        if (r.name.size() > name.size() + 1 &&
+            r.name.compare(r.name.size() - name.size(), name.size(), name) == 0) return true;
     }
-    recent.push_back({ name, now });
+
+    // 這個人離開了 → 清掉他的 JOIN 記錄，否則「離開幾分鐘後重進」會被 5 分鐘去重吞掉
+    if (type == "LEAVE") {
+        for (auto it = recent.begin(); it != recent.end(); ) {
+            if (it->type == "JOIN" && it->name == name) it = recent.erase(it); else ++it;
+        }
+        std::lock_guard<std::mutex> lock(g_seenMutex);
+        g_seen.erase("JOIN|" + name);
+    }
+
+    recent.push_back({ type, name, now });
     if (recent.size() > 200) recent.erase(recent.begin());
     return Duplicate(type + "|" + name);
 }
@@ -327,8 +356,12 @@ void HandleWindow(const char* win, size_t len, const char* tag, bool worldCtx) {
     if (f.type.empty()) return;
 
     if (f.type == "JOIN" || f.type == "LEAVE" || f.type == "DEATH") {
-        if (!worldCtx) return;                     // 大廳/選單的 UI 文字也會寫「加入了遊戲」
-
+        // 舊版這裡要求 worldCtx（同一個掃描塊裡同時出現 chat_visible），
+        // 但實測那個條件幾乎永遠不成立 → 「有人加入」一次都沒抓到過，
+        // 連帶讓「封禁名單玩家一加入就踢」完全沒觸發。
+        // 改用「排除 UI 句子」來擋誤報，實務上可靠得多。
+        if (LooksLikeUiSentence(s)) return;
+        (void)worldCtx;
         if (f.type == "DEATH") {
             // 這個伺服器的死亡廣播固定是 "> 名字 kill by 兇手"，只認這種格式
             std::string line = StringContaining(s, f.kwPos);
