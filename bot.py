@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.2"
+__version__ = "9.7.3"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -651,6 +651,7 @@ class MCWebSocketServer:
         self.on_kick_result: Optional[Callable] = None
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
+        self.on_room_change: Optional[Callable] = None   # 自己加入/離開＝換房間
 
     # ------------------------------------------------ 對外狀態
     @property
@@ -927,6 +928,12 @@ class MCWebSocketServer:
         if not looks_like_player_name(name):
             log.info(f"🚫 忽略不像玩家名的加入事件: {name[:32]!r}")
             return
+        if name.lower() == MC_PLAYER_NAME.lower():
+            # 自己（重新）進入世界＝換房間：在線名單先清空，之後的統計跟著新房間走
+            self.players.clear()
+            log.info("🏠 偵測到自己加入 → 視為切換房間，統計重置")
+            if self.on_room_change:
+                await self.on_room_change(True)
         self.players.add(name)
         log.info(f"➕ {name} 加入")
         if ENABLE_JOIN_LEAVE and self.on_join:
@@ -939,6 +946,11 @@ class MCWebSocketServer:
         if not looks_like_player_name(name):
             log.info(f"🚫 忽略不像玩家名的離開事件: {name[:32]!r}")
             return
+        if name.lower() == MC_PLAYER_NAME.lower():
+            self.players.clear()
+            log.info("🏠 偵測到自己離開 → 視為離開房間，統計重置")
+            if self.on_room_change:
+                await self.on_room_change(False)
         self.players.discard(name)
         log.info(f"➖ {name} 離開")
         if ENABLE_JOIN_LEAVE and self.on_leave:
@@ -1670,6 +1682,7 @@ class StatusBoard:
         self.message_id = 0
         self.task: Optional[asyncio.Task] = None
         self._proc_cache: Tuple[float, Optional[float]] = (0.0, None)
+        self.room_started_at: Optional[float] = None   # 換房間時更新
         self._max_players = MC_MAX_PLAYERS
         self.load()
 
@@ -1709,8 +1722,13 @@ class StatusBoard:
         self._proc_cache = (now, cached)
         return cached
 
+    def mark_room_switch(self):
+        """換房間：運行時間從現在重新算（bot 重啟後沒偵測到就退回遊戲進程時間）。"""
+        self.room_started_at = time.time()
+
     def uptime_seconds(self) -> float:
-        return max(0.0, time.time() - (self._game_started_at() or BOT_STARTED_AT))
+        base = self.room_started_at or (self._game_started_at() or BOT_STARTED_AT)
+        return max(0.0, time.time() - base)
 
     def render(self) -> str:
         online = len(self.client.mc.players)
@@ -1741,6 +1759,11 @@ class StatusBoard:
             log.info(f"📊 狀態列 seed：遊戲回報 {online}/{self._max_players} 人")
 
     # ------------------------------------------------ 動作
+    async def reseed(self):
+        """換房間後重新問一次 list：在線人數與上限跟著新房間走。"""
+        await self.seed()
+        await self.refresh()
+
     async def _records_segment(self) -> str:
         """「🛡 封禁系統已封禁 N 名玩家」：只在外部紀錄源連上時才顯示。"""
         counter = getattr(self.client, "ban_records", None)
@@ -1881,7 +1904,6 @@ class DCListener(discord.Client):
         self._tp_alert_at: Dict[str, float] = {}   # TP 提示節流（同一類別幾分鐘只發一次）
         self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
         self._deferred_task: Optional[asyncio.Task] = None
-        self._global_clear_task: Optional[asyncio.Task] = None
         self._dc_buffer: deque = deque()           # Discord 還沒就緒時暫存的訊息
         self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
@@ -1910,14 +1932,6 @@ class DCListener(discord.Client):
     # ------------------------------------------------ 生命週期
     async def setup_hook(self):
         self.tree.on_error = self.on_tree_error
-
-        # 以前這裡會 await 一次「清空全域指令」的 sync（送一個 bulk overwrite 請求）。
-        # 那個請求碰到 Discord 的 rate limit 時會重試 30~60 秒，而 setup_hook 是在
-        # gateway 連線「之前」跑的 —— 結果就是每次重啟 bot 都要幾十秒才上線，
-        # 這段時間遊戲的加入 / 聊天事件全部被丟掉（畫面上「++ 玩家加入了遊戲」有出現，
-        # Discord 卻什麼都沒有）。現在改成登入後才在背景清，且不動本地指令樹。
-        if self._global_clear_task is None or self._global_clear_task.done():
-            self._global_clear_task = asyncio.create_task(self._clear_global_commands())
 
         for cmd in (self.slash_status, self.slash_ping, self.slash_players,
                     self.slash_check, self.slash_cmd,
@@ -1953,23 +1967,6 @@ class DCListener(discord.Client):
                     _bind(child)
             else:
                 _bind(command)
-
-    async def _clear_global_commands(self):
-        """把 Discord 上殘留的「全域指令」清掉（背景執行，不擋登入）。
-
-        關鍵：用一個**空的獨立指令樹**去 sync，不要動 self.tree。
-        以前是 self.tree.clear_commands(guild=None) + sync()，清完忘了放回去，
-        後面任何一次 copy_global_to(guild) 就會把空清單同步上 guild → 指令整批消失。
-        """
-        await self.wait_until_ready()
-        try:
-            empty = app_commands.CommandTree(self)
-            await asyncio.wait_for(empty.sync(), timeout=25)
-            log.info("🧹 已清空全域斜線指令，改用 guild 指令")
-        except asyncio.TimeoutError:
-            log.warning("⚠️ 清空全域指令逾時（Discord 限流），不影響 guild 指令")
-        except Exception as exc:
-            log.warning(f"清空全域指令失敗: {exc}")
 
     async def _flush_dc_buffer(self):
         """把「還沒登入時收到的遊戲事件」補發到 Discord。"""
@@ -2294,6 +2291,33 @@ class DCListener(discord.Client):
     async def on_mc_leave(self, player: str):
         if ENABLE_JOIN_LEAVE:
             await self._send_to_discord("伺服器", f"❌ **{player}** 離開了遊戲")
+
+    async def on_room_change(self, rejoined: bool):
+        """自己加入/離開＝換房間：所有「跟著房間走」的統計重置。
+
+        房主不是固定的 —— 進哪個房間，狀態列的數字就該是哪個房間的。
+        在線名單在 mc 那邊已清空，這裡把 bot 端的累計與節流狀態一併清掉，
+        並把運行時間的起點改成本次進房時間，再重新問一次 list。
+        """
+        self._seen_players.clear()
+        self._tp_kicked.clear()
+        self._tp_announced.clear()
+        self._tp_alert_at.clear()
+        self.board.mark_room_switch()
+        log.info("🏠 已切換房間：在線 / 已加入 / 運行時間統計重置")
+        try:
+            await self._send_to_discord(
+                "伺服器", "🏠 **已切換房間**，在線人數 / 已加入 / 運行時間統計已重置")
+        except Exception:
+            pass
+        if rejoined:
+            async def _reseed_later():
+                await asyncio.sleep(4)          # 等遊戲安頓，list 才查得到新房間的人
+                try:
+                    await self.board.reseed()
+                except Exception as exc:
+                    log.debug(f"換房間 reseed 失敗: {exc}")
+            _spawn(_reseed_later())
 
     async def on_mc_death(self, player: str, message: str):
         text = message.strip() or f"**{player}** 死亡了"
@@ -3322,6 +3346,7 @@ def _wire(mc: MCWebSocketServer, bot: DCListener):
     mc.on_tp_join = bot.on_mc_tp_join
     mc.on_ban = bot.on_mc_ban
     mc.on_kick_result = bot.on_kick_result
+    mc.on_room_change = bot.on_room_change
     mc.on_connected = bot.on_bridge_connected
     mc.on_disconnected = bot.on_bridge_disconnected
 
