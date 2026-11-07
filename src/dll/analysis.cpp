@@ -656,6 +656,13 @@ void DumpChatRaw(const std::string& t) {
     // 校正用：把「掃描到的每一條字串」原樣寫到 chat_raw.txt（不去重、不篩選），
     // 讓我們能看出當前版本聊天到底長什麼樣。只在校正期使用。
     static std::unordered_set<std::string> seen;
+    static DWORD lastReset = GetTickCount();
+    // 每 5 分鐘清空一次去重集合：否則 30000 條滿了之後 chat_raw 就不再更新，
+    // 換房間 / 進多人世界後就看不到 DLL 到底掃到什麼，很難校正聊天格式。
+    if (GetTickCount() - lastReset > 300000) {
+        lastReset = GetTickCount();
+        seen.clear();
+    }
     if (seen.size() > 30000) return;
     if (!seen.insert(t).second) return;
 

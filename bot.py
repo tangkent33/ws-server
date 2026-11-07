@@ -57,7 +57,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.13"
+__version__ = "9.7.14"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -148,15 +148,9 @@ TP_ANNOUNCE_TEXT = os.getenv("TP_ANNOUNCE_TEXT", "§e[TP] §f玩家嘗試加入�
 KICK_QUEUE_TTL = _env_int("KICK_QUEUE_TTL", 600)            # 排隊多久還沒連上就作廢（秒）
 KICK_QUEUE_MAX = _env_int("KICK_QUEUE_MAX", 50)             # 佇列上限，避免爆量
 
-# 斜線指令要不要在 bot 關閉前主動刪掉。
-#
-# Discord 對「每個伺服器的指令覆蓋」限流很兇：每 10 分鐘只允許 2 次 PUT。
-# 舊版預設 true（離線就刪指令），結果「退出清空」+「重啟註冊」連續消耗限流額度，
-# 撞 429 後指令被清空又註冊不回來 → 用戶看到的現象就是「斜線指令消失」。
-#
-# 改成預設 false：指令**常駐** Discord，關閉不主動刪，啟動直接刷新覆蓋即可。
-CLEAR_COMMANDS_ON_EXIT = _env_bool("CLEAR_COMMANDS_ON_EXIT", "false")
-
+# 斜線指令「常駐」Discord：bot 關閉時**不主動刪除**，重啟後直接刷新覆蓋。
+# （舊版曾做過「離線就刪指令」，但 Discord 對指令覆蓋限流每 10 分鐘只 2 次，
+#   退出清空 + 重啟註冊連續消耗額度，撞 429 後指令就消失、註冊不回來。）
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")
 
@@ -2404,55 +2398,10 @@ class DCListener(discord.Client):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # 必須在 super().close() 之前做：那之後 HTTP 連線就關了，sync 會失敗
-        if CLEAR_COMMANDS_ON_EXIT and not self.is_closed():
-            await self._clear_all_commands()
-
         if self._session:
             await self._session.close()
             self._session = None
         await super().close()
-
-    async def _clear_all_commands(self):
-        """把 Discord 上的斜線指令全部刪掉（含全域與各伺服器）。
-
-        Discord 的指令是常駐的，bot 下線後仍會出現在列表裡；
-        要實現「離線就看不到指令」，只能在退出前主動清空。
-        """
-        if not self.is_ready():
-            return          # 沒真的登入過，沒有東西要清
-        try:
-            await asyncio.wait_for(self._do_clear_all_commands(), timeout=25)
-        except asyncio.TimeoutError:
-            log.warning("⚠️ 移除斜線指令逾時，可能還有殘留")
-        except Exception as exc:
-            log.warning(f"⚠️ 移除斜線指令失敗: {exc}")
-
-    async def _do_clear_all_commands(self):
-        for guild in list(self.guilds):
-            obj = discord.Object(id=guild.id)
-            if not self._sync_allowed(guild.id):
-                log.warning(f"⏳ 跳過移除 {guild.name} 的指令（限流中，Discord 端指令保留）")
-                continue
-            try:
-                self.tree.clear_commands(guild=obj)
-                await self.tree.sync(guild=obj)
-                self._mark_synced(guild.id)
-                log.info(f"🧹 已移除 {guild.name} 的斜線指令")
-            except Exception as exc:
-                log.warning(f"移除 {guild.name} 的斜線指令失敗: {exc}")
-
-        try:
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            log.info("🧹 已移除全域斜線指令")
-        except Exception as exc:
-            log.warning(f"移除全域斜線指令失敗: {exc}")
-
-        self._synced_guilds.clear()
-        # 指令已從 Discord 移除，本地簽名也要清掉，否則下次啟動會誤判「沒變」而跳過同步
-        self._cmd_sync_state.clear()
-        self._save_cmd_sync_state()
 
     def _sync_allowed(self, guild_id: int) -> bool:
         """Discord 對 guild 指令覆蓋限流：每 10 分鐘只允許 2 次。
@@ -4089,7 +4038,7 @@ def _cli_stop() -> None:
     for _ in range(30):
         time.sleep(0.5)
         if not _port_open(LOCK_PORT):
-            print("[stop] bot 已停止，斜線指令已從 Discord 移除")
+            print("[stop] bot 已停止（斜線指令保留在 Discord，可繼續使用）")
             return
     print("[stop] ⚠️ bot 還在關閉中，稍等一下（或直接關掉視窗）")
 

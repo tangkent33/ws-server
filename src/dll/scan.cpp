@@ -28,6 +28,36 @@ static const unsigned char* FindBytes(const unsigned char* hay, size_t hayLen, c
     return nullptr;
 }
 
+// 判斷原始位元組裡有沒有 Minecraft 的 § 色碼（UTF-8 為 C2 A7，也有舊式單字節 0xA7）。
+// 世界內的聊天 HUD 字串一定帶色碼（名字/訊息各自上色），而 HTTP 回應頭、SQLite 錯誤、
+// 記憶體碎片這些「key: value」垃圾幾乎都不帶色碼——用這個當「名字: 訊息」格式的閘門，
+// 就能把整片記憶體垃圾擋在 Discord 之外。
+static bool HasColorCode(const unsigned char* p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == 0xC2 && i + 1 < n && p[i + 1] == 0xA7) return true;  // § (UTF-8)
+        if (p[i] == 0xA7 && i + 1 < n) {                                  // 舊式單字節 §
+            unsigned char nx = p[i + 1];
+            if ((nx >= '0' && nx <= '9') || (nx >= 'a' && nx <= 'f') ||
+                (nx >= 'A' && nx <= 'F') || nx == 'k' || nx == 'l' || nx == 'm' ||
+                nx == 'n' || nx == 'o' || nx == 'r' || nx == 'x')
+                return true;
+        }
+    }
+    return false;
+}
+
+// 判斷字串裡有沒有中日韓文字（CJK 統一表意文字區段）。
+static bool HasCJK(const std::string& s) {
+    for (size_t i = 0; i + 2 < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0xE4 && c <= 0xE9 &&
+            ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
+            ((unsigned char)s[i + 2] & 0xC0) == 0x80)
+            return true;
+    }
+    return false;
+}
+
 static void ScanChatSegments(const unsigned char* buf, size_t len) {
     size_t i = 0;
     while (i < len) {
@@ -45,13 +75,38 @@ static void ScanChatSegments(const unsigned char* buf, size_t len) {
         if (t.size() < 4 || t.size() > 200) continue;
         DumpChatRaw(t);
 
-        // 只接受「整條字串就是 <名字> 訊息」的情況（色碼已被 Sanitize 去掉），
-        // 不接受 "xxx> yyy" 這種，否則會把 UI/資源字串全抓進來。
-        if (t[0] != '<') continue;
-        size_t gt = t.find('>');
-        if (gt == std::string::npos || gt < 3 || gt > 17 || gt + 1 >= t.size() || t[gt + 1] != ' ') continue;
-        std::string name = t.substr(1, gt - 1);
-        std::string msg = Trim(t.substr(gt + 2));
+        std::string name, msg;
+
+        // 格式 1：<名字> 訊息（原生基岩版聊天）
+        if (t[0] == '<') {
+            size_t gt = t.find('>');
+            if (gt == std::string::npos || gt < 3 || gt > 17 || gt + 1 >= t.size() || t[gt + 1] != ' ') continue;
+            name = t.substr(1, gt - 1);
+            msg = Trim(t.substr(gt + 2));
+        }
+        // 格式 2：名字: 訊息（伺服器腳本重寫的聊天，如 "tangkent3: eewe"）
+        // 很多伺服器會用腳本把聊天從 <名字> 改成「名字: 訊息」，舊版只認尖括號，
+        // 這類房間的聊天就永遠抓不到（PlayerMessage 一直空）。
+        else {
+            // 只有含色碼的「名字: 訊息」才算聊天：世界內聊天 HUD 一定帶 § 色碼，
+            // 而 HTTP 回應頭 / SQLite 錯誤 / 記憶體碎片這些 key:value 垃圾幾乎都不帶，
+            // 用這道閘門就能把整片記憶體垃圾擋在 Discord 之外。
+            if (!HasColorCode(buf + s, n)) continue;
+            size_t colon = t.find(": ");
+            if (colon == std::string::npos || colon < 3 || colon > 20 || colon + 2 >= t.size()) continue;
+            name = t.substr(0, colon);
+            msg = Trim(t.substr(colon + 2));
+            if (msg.size() < 2) continue;               // 擋單字元碎片
+            if (msg.find('(') != std::string::npos || msg.find(':') != std::string::npos) continue;
+            // 區分真實聊天和 UI 說明文字：這伺服器玩家聊天幾乎都是中文（或短英文），
+            // 而世界設定介面的欄位說明是「長英文完整句子」（含句號、>25 字元），
+            // 兩者都帶色碼、都是「名字: 訊息」格式，只能靠內容特徵分開。
+            if (!HasCJK(msg)) {
+                if (msg.size() > 25) continue;                          // 長英文 → 說明文字
+                if (msg.find('.') != std::string::npos) continue;       // 含句號 → 完整句子
+            }
+        }
+
         if (!ChatNameOk(name)) continue;
         DebugChat(t);                                   // 只記錄「通過名字檢查」的候選，方便校正
         if (!ChatMessageOk(msg)) continue;

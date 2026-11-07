@@ -43,7 +43,7 @@ echo [%date% %time%] starting bot.py ...
 %PY% bot.py
 if exist "bot_stop.flag" (
   del "bot_stop.flag" >nul 2>nul
-  echo [%date% %time%] bot 已停止（斜线指令已从 Discord 移除），不自动重启。
+  echo [%date% %time%] bot 已停止（斜线指令保留在 Discord），不自动重启。
   goto end
 )
 echo [%date% %time%] bot exited, restarting in 5s ...
