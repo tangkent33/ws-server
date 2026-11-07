@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.9"
+__version__ = "9.7.10"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -2163,6 +2163,7 @@ class DCListener(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
+        self._sync_at: Dict[int, List[float]] = {}  # guild_id → 最近 sync 時間（限流保護）
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
         self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
         self._tp_announced: Dict[str, float] = {}  # TP 玩家最近一次公屏播報的時間
@@ -2359,9 +2360,13 @@ class DCListener(discord.Client):
     async def _do_clear_all_commands(self):
         for guild in list(self.guilds):
             obj = discord.Object(id=guild.id)
+            if not self._sync_allowed(guild.id):
+                log.warning(f"⏳ 跳過移除 {guild.name} 的指令（限流中，Discord 端指令保留）")
+                continue
             try:
                 self.tree.clear_commands(guild=obj)
                 await self.tree.sync(guild=obj)
+                self._mark_synced(guild.id)
                 log.info(f"🧹 已移除 {guild.name} 的斜線指令")
             except Exception as exc:
                 log.warning(f"移除 {guild.name} 的斜線指令失敗: {exc}")
@@ -2375,23 +2380,55 @@ class DCListener(discord.Client):
 
         self._synced_guilds.clear()
 
-    async def _sync_guild_commands(self, guilds=None):
-        """把本地指令樹同步到伺服器。
+    def _sync_allowed(self, guild_id: int) -> bool:
+        """Discord 對 guild 指令覆蓋限流：每 10 分鐘只允許 2 次。
+
+        超過就回 False。這是「指令一同步就消失」的元兇——關閉 bot 清一次、
+        啟動註冊一次、再手動 !sync 一次，三連發全撞 429，指令被清空後又
+        註冊不回來。這裡先把額度管起來，寧可跳過也不要撞限流。
+        """
+        now = time.monotonic()
+        recent = [t for t in self._sync_at.get(guild_id, []) if now - t < 600]
+        self._sync_at[guild_id] = recent
+        return len(recent) < 2
+
+    def _mark_synced(self, guild_id: int):
+        self._sync_at.setdefault(guild_id, []).append(time.monotonic())
+
+    async def _resync_after_limit(self):
+        """限流窗口（10 分鐘）過後自動補一次同步，把指令註冊回去。"""
+        await asyncio.sleep(600)
+        log.info("🔄 Discord 指令限流窗口已過，自動重新同步")
+        self._synced_guilds.clear()
+        try:
+            await self._sync_guild_commands()
+        except Exception as exc:
+            log.warning(f"自動重新同步失敗: {exc}")
+
+    async def _sync_guild_commands(self, guilds=None) -> Tuple[int, int]:
+        """把本地指令樹同步到伺服器。回傳 (已同步數, 限流跳過數)。
 
         關鍵：同步前先清空該伺服器的指令樹，否則舊版殘留（改了參數的 /status、
         已刪掉的 /join…）會留在 Discord 上，使用者一按就 CommandSignatureMismatch。
         """
+        synced = skipped = 0
         for guild in (guilds if guilds is not None else self.guilds):
             obj = discord.Object(id=guild.id)
+            if not self._sync_allowed(guild.id):
+                skipped += 1
+                log.warning(f"⏳ {guild.name} 的指令同步被 Discord 限流，跳過本次")
+                continue
             names = ""
             for attempt in range(1, 4):
                 try:
                     self.tree.clear_commands(guild=obj)
                     self.tree.copy_global_to(guild=obj)
-                    synced = await self.tree.sync(guild=obj)
-                    names = ", ".join(sorted(f"/{c.name}" for c in synced))
+                    synced_cmds = await self.tree.sync(guild=obj)
+                    names = ", ".join(sorted(f"/{c.name}" for c in synced_cmds))
                     self._synced_guilds.add(guild.id)
-                    log.info(f"🧹 已同步 {guild.name} 的 {len(synced)} 個指令: {names}")
+                    self._mark_synced(guild.id)
+                    log.info(f"🧹 已同步 {guild.name} 的 {len(synced_cmds)} 個指令: {names}")
+                    synced += 1
                     break
                 except Exception as exc:
                     log.warning(f"同步 {guild.name} 失敗（第 {attempt} 次）: {exc}")
@@ -2399,6 +2436,10 @@ class DCListener(discord.Client):
                         await asyncio.sleep(2 * attempt)
             else:
                 log.error(f"❌ {guild.name} 的斜線指令同步失敗，Discord 上可能還是舊的")
+
+        if skipped and not synced:
+            _spawn(self._resync_after_limit())
+        return synced, skipped
 
     async def on_tree_error(self, interaction: discord.Interaction, error: Exception):
         """指令簽名不符時自動重新同步，而不是只丟一大段 traceback。"""
@@ -3267,8 +3308,16 @@ class DCListener(discord.Client):
 
         await interaction.response.defer(ephemeral=True)
         self._synced_guilds.clear()
-        await self._sync_guild_commands()
-        await interaction.followup.send("✅ 已重新同步斜線指令", ephemeral=True)
+        synced, skipped = await self._sync_guild_commands()
+        if skipped and not synced:
+            await interaction.followup.send(
+                "⏳ 指令同步被 Discord 限流（每 10 分鐘只能 2 次），已排定稍後自動補同步。\n"
+                "Discord 上原本的指令不會被動到，等幾分鐘就會自己回來。", ephemeral=True)
+        else:
+            text = f"✅ 已重新同步 {synced} 個伺服器的斜線指令"
+            if skipped:
+                text += f"（{skipped} 個因限流跳過）"
+            await interaction.followup.send(text, ephemeral=True)
 
     @app_commands.command(name="shutdown", description="關閉 bot（斜線指令會一併消失）")
     async def slash_shutdown(self, interaction: discord.Interaction):
@@ -3509,8 +3558,14 @@ class DCListener(discord.Client):
             return
         status = await message.reply("🔄 同步中...")
         self._synced_guilds.clear()
-        await self._sync_guild_commands()
-        await status.edit(content="✅ 已同步斜線指令")
+        synced, skipped = await self._sync_guild_commands()
+        if skipped and not synced:
+            await status.edit(content="⏳ 指令同步被 Discord 限流（每 10 分鐘只能 2 次），已排定稍後自動補同步。原本的指令不會被動到。")
+        else:
+            text = f"✅ 已同步 {synced} 個伺服器的斜線指令"
+            if skipped:
+                text += f"（{skipped} 個因限流跳過）"
+            await status.edit(content=text)
 
     async def _cmd_ban(self, message: discord.Message):
         if not self._check_perm(message):
