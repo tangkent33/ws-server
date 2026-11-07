@@ -364,7 +364,17 @@ void HandleWindow(const char* win, size_t len, const char* tag, bool worldCtx) {
         }
         size_t sp = name.find_first_of(" \t");
         if (sp != std::string::npos) name = name.substr(0, sp);
-        if (name.size() < 2 || name.size() > 20 || !NameOk(name)) return;
+        if (name.size() < 3 || name.size() > 16 || !NameOk(name)) return;
+        // 嚴格一點：基岩版名字只會是英數/底線。記憶體碎片常混進 '.' 或外掛字樣，
+        // 拿去 kick 只會讓遊戲回「沒有與選擇器匹配的目標」。
+        for (char c : name) {
+            if (!isalnum((unsigned char)c) && c != '_') return;
+        }
+        {
+            std::string lowered = name;
+            for (auto& c : lowered) c = (char)tolower((unsigned char)c);
+            if (lowered.find("tpmultiplayer") != std::string::npos) return;
+        }
         std::string key = "TPJOIN|" + name;
         if (Duplicate(key)) return;
         SendLine("TPJOIN|" + name);
@@ -403,21 +413,35 @@ void HandleWindow(const char* win, size_t len, const char* tag, bool worldCtx) {
     }
 
     if (f.type == "TP") {
+        // 外掛自己在聊天欄印的說明文字，不是有人加入：
+        //   * 外部 在 TP Multiplayer 上發現全球所有xbox好友的世界
+        //     在网站查看世界列表，无需添加好友即可加入
+        // 每一行尾巴還會黏到不同的記憶體噪聲，去重鍵跟著變 → 整排洗頻。
+        if (line.find(u8"發現全球") != std::string::npos ||
+            line.find(u8"发现全球") != std::string::npos ||
+            line.find(u8"世界列表") != std::string::npos ||
+            line.find(u8"网站查看") != std::string::npos ||
+            line.find(u8"網站查看") != std::string::npos ||
+            line.find(u8"无需添加好友") != std::string::npos ||
+            line.find(u8"無需添加好友") != std::string::npos ||
+            line.find(u8"xbox好友") != std::string::npos ||
+            line.find(u8"Xbox好友") != std::string::npos) {
+            return;
+        }
+
         std::string low = line;
         for (auto& ch : low) ch = (char)tolower((unsigned char)ch);
         size_t x = low.find("tpmultiplayer");
         if (x == std::string::npos) return;
 
-        // 取網域本體（例如 tpmultiplayer.xyz），結尾常黏著二進位雜訊，只收 [a-z0-9.-]
-        size_t e = x;
-        while (e < line.size()) {
-            unsigned char c = (unsigned char)line[e];
-            if (isalnum(c) || c == '.' || c == '-') e++; else break;
-        }
-        std::string domain = line.substr(x, e - x);
-        std::string key = "TP|" + domain.substr(0, 16);   // 同一網域的截斷副本也視為重複
-        if (Duplicate(key)) return;
-        SendLine("TP|TP Multiplayer (" + domain + u8")");
+        // 只認正式網域。記憶體碎片常被截成 "tpmultiplayer.d"、"tpmultiplayer.x8"，
+        // 這些既不合法、每次又都不一樣，會讓去重失效。
+        static const char kDomain[] = "tpmultiplayer.xyz";
+        const size_t kLen = sizeof(kDomain) - 1;
+        if (low.compare(x, kLen, kDomain) != 0) return;
+
+        if (Duplicate("TP|" + std::string(kDomain))) return;
+        SendLine("TP|TP Multiplayer (" + std::string(kDomain) + u8")");
     }
 }
 

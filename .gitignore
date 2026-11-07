@@ -21,3 +21,6 @@ __pycache__/
 # 每次啟動都會生成新檔名的注入副本
 827dll_*.dll
 827dll.old.dll
+
+# 主動停止標記（執行期產生）
+bot_stop.flag

@@ -5,7 +5,7 @@
 | --- | --- |
 | `MC-WS.exe` | 建立 `\\.\pipe\mc_chat_827`、把 DLL 注入 `Minecraft.Windows.exe`、把事件轉成 WebSocket 送到 `127.0.0.1:8000` |
 | `827dll.dll` | 注入到遊戲內的擷取 DLL（掃描記憶體，抓聊天 / 加入 / 離開 / 死亡 / TP / 封禁） |
-| `bot.py` | Discord Bot（單檔 v9.3，已把原本 `bridge/` 套件全部合併進來），接收事件並轉發到頻道 / Webhook |
+| `bot.py` | Discord Bot（單檔 v9.4，已把原本 `bridge/` 套件全部合併進來），接收事件並轉發到頻道 / Webhook |
 | `start.bat` | 一鍵啟動上面兩個 |
 | `old_bridge_20261107/` | 合併前的 `bridge/` 套件備份（程式已不再引用，確認沒問題後可刪） |
 | `bot_v1_backup.py` | 更早的單檔版本備份 |
@@ -52,8 +52,28 @@
 | `/lianji me` | 查自己的 XUID / addid / 中繼帳號 |
 | `/lianji refresh` | 刷新後端粉絲快取 |
 | `/settings` `/sync` `/wl` | 設定 / 重同步指令 / 白名單 |
+| `/shutdown` | 關閉 bot（會先移除斜線指令） |
 
 `<房間>`、`<玩家>` 都支援**自動補全**（打幾個字就會列出房間或線上玩家）。
+
+## 指令跟著 bot 上下線
+
+Discord 的斜線指令註冊後是**常駐**的，bot 離線也還掛在那裡。要讓它「離線就看不到」，
+唯一的方法是退出前主動刪掉 —— 本專案就是這樣做的：
+
+| 時機 | 行為 |
+| --- | --- |
+| `start.bat` / `run_bot.bat` 啟動 | 先清空全域指令，再逐個伺服器同步（先 `clear` 再註冊，蓋掉舊版殘留） |
+| `/shutdown`、`stop.bat`、Ctrl+C、SIGTERM | 清空所有伺服器 + 全域指令 → 斷線 → 寫入 `bot_stop.flag` |
+| `run_bot.bat` 看到 `bot_stop.flag` | 刪掉標記並跳出迴圈，**不再自動重啟** |
+| 非主動退出（崩潰 / 被 taskkill /f） | 來不及清，指令會殘留；下次啟動會重新同步覆蓋 |
+
+`stop.bat` 會先呼叫 `python bot.py --stop`（打 Ban API 的 `POST /shutdown`）走優雅關閉，
+失敗才退回強制結束。也可以手動執行：
+
+```
+py -3 bot.py --stop
+```
 
 ## 指令佇列（v9.3 起）
 
@@ -62,7 +82,29 @@
 
 - 佇列上限 `KICK_QUEUE_MAX`（預設 50），滿了直接丟棄並提示
 - 放超過 `KICK_QUEUE_TTL`（預設 600 秒）就作廢，避免幾小時後突然踢人
+- 補送前會確認那個人**還在線上**；已經離開的不再執行（否則遊戲會回「沒有與選擇器匹配的目標」）
 - 想立刻生效：確認遊戲端 WebSocket 已連上（`/status` 看「遊戲 WebSocket」是否 🟢）
+
+## TP 偵測的誤判防護（v9.3）
+
+TP Multiplayer 外掛自己會在聊天欄印橫幅：
+
+```
+* 外部 在 TP Multiplayer 上發現全球所有xbox好友的世界
+  在网站查看世界列表，无需添加好友即可加入
+  tpmultiplayer.xyz
+```
+
+這段以前被當成「偵測到 TP 平台特徵」而狂刷 Discord，尾巴的二進位噪聲
+（`tpmultiplayer.d`、`tpmultiplayer.x8`…）還讓去重失效。現在三層擋：
+
+| 位置 | 規則 |
+| --- | --- |
+| DLL `analysis.cpp` | 含「發現全球 / 世界列表 / 网站查看 / xbox好友」的整行直接丟棄；網域只認 `tpmultiplayer.xyz`，其餘碎片丟棄 |
+| DLL `TPJOIN` | 名字必須 3~16 位英數/底線，含 `tpmultiplayer` 的直接丟棄 |
+| bot `bot.py` | `is_tp_banner()` 再擋一次；提示以「去掉括號內容」為鍵做 180 秒節流；`valid_player_name()` 擋掉垃圾名字，**不合格的連踢都不會排隊** |
+
+真正的加入告警仍走 `try connect: <名字>` / `玩家嘗試加入 => 名稱:…` 兩條錨點。
 
 ## 已知限制
 - Discord → 遊戲的訊息 / 指令走**遊戲端 WebSocket**（`/connect ws://127.0.0.1:8000`）。
@@ -124,7 +166,7 @@ TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 ## 程式結構
 
 ```
-bot.py                 單檔程式（v9.3），依「目錄」分段：
+bot.py                 單檔程式（v9.4），依「目錄」分段：
   1  設定與日誌          .env 讀取、輪替式 bot.log（5MB × 3）
   2  文字工具            § 色碼、rawtext、UI 洗頻
   3  JSON 檔案存放       白名單 / 封禁名單 / 頻道設定（原子寫入）

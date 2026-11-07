@@ -33,9 +33,12 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,7 +55,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.3.0"
+__version__ = "9.4.0"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -83,6 +86,8 @@ MC_PLAYER_NAME = os.getenv("MC_PLAYER_NAME", "tangkent3")
 WHITELIST_FILE = os.path.expanduser(os.getenv("WHITELIST_FILE", "~/whitelist.json"))
 BLACKLIST_FILE = str(BASE_DIR / os.getenv("BLACKLIST_FILE", "blacklist.json"))
 CONFIG_FILE = os.path.expanduser(os.getenv("BRIDGE_CONFIG_FILE", "~/bridge_config.json"))
+# 這個檔案存在代表「這次是使用者主動停的」，run_bot.bat 看到就不要自動重啟
+STOP_FLAG = BASE_DIR / "bot_stop.flag"
 # 舊變數名 MIAOO_ 少一個 A，兩種拼法都接受，避免 .env 改了名字反而失效
 MIAOO_API_BASE = (os.getenv("MIAAOO_API_BASE")
                   or os.getenv("MIAOO_API_BASE")
@@ -101,10 +106,15 @@ ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
 TP_KICK = _env_bool("TP_KICK", "true")
 TP_KICK_REASON = os.getenv("TP_KICK_REASON", "偵測到 TP 平台加入")
 TP_KICK_COOLDOWN = _env_int("TP_KICK_COOLDOWN", 20)         # 同一人幾秒內不重複踢
+TP_ALERT_COOLDOWN = _env_int("TP_ALERT_COOLDOWN", 180)      # 同一類 TP 提示幾秒內只發一次
 
 # 遊戲 WebSocket 沒連線時，指令排隊等連上再送（不再退回鍵盤注入）
 KICK_QUEUE_TTL = _env_int("KICK_QUEUE_TTL", 600)            # 排隊多久還沒連上就作廢（秒）
 KICK_QUEUE_MAX = _env_int("KICK_QUEUE_MAX", 50)             # 佇列上限，避免爆量
+
+# 斜線指令跟著 bot 的壽命走：啟動時註冊，關閉前全部刪掉
+# （Discord 的指令本身是常駐的，只能靠「退出前主動刪除」來實現）
+CLEAR_COMMANDS_ON_EXIT = _env_bool("CLEAR_COMMANDS_ON_EXIT", "true")
 
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")
@@ -198,6 +208,45 @@ def _clip(text: str, limit: int = MAX_MESSAGE) -> str:
 
 # ============================================================ 2. 文字工具
 COLOR_CODE = re.compile(r"§.")
+
+# TP Multiplayer 外掛自己的橫幅。遊戲一載入、每次廣播都會印，
+# 例如「* 外部 在 TP Multiplayer 上發現全球所有xbox好友的世界 …」
+# 那不是有人用 TP 進來，只是外掛在講話 → 不能當成入侵告警。
+TP_BANNER_MARKERS = (
+    "發現全球", "发现全球", "世界列表", "网站查看", "網站查看",
+    "无需添加好友", "無需添加好友", "xbox好友", "Xbox好友",
+)
+
+PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+
+TP_DOMAIN_RE = re.compile(r"tpmultiplayer\.([a-z0-9]+)", re.IGNORECASE)
+
+
+def is_tp_banner(text: str) -> bool:
+    """是不是 TP 外掛自己印的說明文字 / 記憶體噪聲（不是真的有人加入）。"""
+    lowered = str(text or "")
+    if any(marker in lowered for marker in TP_BANNER_MARKERS):
+        return True
+    # "TP Multiplayer (tpmultiplayer.d)"：網域被截斷成噪聲，只有 .xyz 才算數
+    domain = TP_DOMAIN_RE.search(lowered)
+    if domain and domain.group(1).lower() != "xyz":
+        return True
+    return False
+
+
+def valid_player_name(name: str) -> bool:
+    """合法的基岩版玩家名：3~16 位英數或底線。
+
+    記憶體碎片會混進 "tpmultiplayer.d"、"x8" 這種東西，
+    拿去 kick 只會讓遊戲回「沒有與選擇器匹配的目標」。
+    """
+    name = str(name or "").strip()
+    if not PLAYER_NAME_RE.match(name):
+        return False
+    if "tpmultiplayer" in name.lower():
+        return False
+    return True
+
 
 # 伺服器 UI 廣播（tellraw 狀態面板之類），不要往 Discord 送
 UI_SPAM_KEYWORDS = ("系統狀態", "掃地倒數", "你的錢包", "VIP等級", "當前人數", "你的名字")
@@ -639,12 +688,22 @@ class MCWebSocketServer:
 
         elif event == "TP_JOIN":
             name = strip_colors(self._player_name(body)).strip()
-            if name and self.on_tp_join:
+            if not name:
+                return
+            if not valid_player_name(name):
+                log.info(f"🚫 忽略不像玩家名的 TP 事件: {name[:32]!r}")
+                return
+            if self.on_tp_join:
                 await self.on_tp_join(name)
 
         elif event == "TP_DETECT":
             msg = str(body.get("message") or "")
-            if msg and ENABLE_TP_ALERT and self.on_tp:
+            if not msg or not ENABLE_TP_ALERT:
+                return
+            if is_tp_banner(msg):
+                log.debug(f"忽略 TP 外掛橫幅: {_clip(msg, 60)}")
+                return
+            if self.on_tp:
                 await self.on_tp(msg)
 
         # 鍵盤注入的執行結果（DLL 回報：ok|injected 或 fail|game not focused）
@@ -827,12 +886,24 @@ async def start_ban_api(bot: "DCListener", store: BanStore) -> web.AppRunner:
         ok = store.unban(name)
         return web.json_response({"ok": ok, "userId": name}, status=200 if ok else 404)
 
+    async def shutdown(request: web.Request):
+        """讓 bot 優雅下線：先移除斜線指令，再斷開 Discord。
+
+        stop.bat / `python bot.py --stop` 就是打這支；直接用 taskkill 不會走到這裡。
+        """
+        if not _api_authorized(request):
+            return _unauthorized()
+        log.info("🛑 收到 HTTP 關閉請求")
+        _spawn(bot.request_shutdown())
+        return web.json_response({"ok": True, "message": "正在關閉（會一併移除斜線指令）"})
+
     app = web.Application()
     app.add_routes([
         web.get("/is-banned/{name}", is_banned),
         web.get("/banned", list_banned),
         web.post("/ban", ban),
         web.post("/unban", unban),
+        web.post("/shutdown", shutdown),
     ])
 
     runner = web.AppRunner(app)
@@ -1189,6 +1260,7 @@ class DeferredCmd:
     cmd: str
     label: str
     created: float
+    player: str = ""        # 踢人指令才有：補送前先確認這人還在線上
 
 
 class RoomPaginator(discord.ui.View):
@@ -1293,8 +1365,11 @@ class DCListener(discord.Client):
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
         self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
+        self._tp_alert_at: Dict[str, float] = {}   # TP 提示節流（同一類別幾分鐘只發一次）
         self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
         self._deferred_task: Optional[asyncio.Task] = None
+        self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
+        self._closing = False                      # close() 進來過就別再進來
         self._handlers: Dict[str, Callable] = {
             "!sync": self._cmd_sync,
             "!status": self._cmd_status,
@@ -1331,12 +1406,36 @@ class DCListener(discord.Client):
                     self.slash_check, self.slash_cmd,
                     self.slash_kick, self.slash_ban, self.slash_unban, self.slash_banned,
                     self.slash_settings, self.slash_sync, self.slash_wl,
+                    self.slash_shutdown,
                     self.slash_join, self.lianji):
             self.tree.add_command(cmd)
+
+        self._bind_commands()
 
         # 遊戲 WebSocket 沒連線時，指令排隊等它連上再送
         if self._deferred_task is None or self._deferred_task.done():
             self._deferred_task = asyncio.create_task(self._deferred_worker())
+
+    def _bind_commands(self):
+        """把每個指令綁到這個 bot 實例上。
+
+        在類別裡用 `@app_commands.command` 定義時，裝飾器拿到的是**未綁定的函式**，
+        discord.py 只會從 `callback.__self__` 取 binding，所以 `Command.binding` 是 None。
+        執行時 `_do_call` 見 binding 為 None 就只傳 `interaction`，少傳 `self` →
+        拋 TypeError；而 discord.py 會把「呼叫時參數不對」的 TypeError 誤判成
+        CommandSignatureMismatch，看起來就像「指令沒同步」。
+
+        結果就是：**所有斜杠指令都回「指令定義已更新，已自動重新同步」**。
+        """
+        def _bind(command):
+            command.binding = self
+
+        for command in self.tree.get_commands():
+            if isinstance(command, app_commands.Group):
+                for child in command.commands:
+                    _bind(child)
+            else:
+                _bind(command)
 
     async def on_disconnect(self):
         log.warning("⚠️ Discord 連線中斷，準備重連")
@@ -1357,17 +1456,68 @@ class DCListener(discord.Client):
         if pending:
             await self._sync_guild_commands(pending)
 
+    async def request_shutdown(self) -> None:
+        """主動下線：先移除 Discord 上註冊的斜線指令，再斷線。"""
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        log.info("🛑 收到關閉請求，準備移除斜線指令後下線")
+        await self.close()
+
     async def close(self):
+        if self._closing:
+            return
+        self._closing = True
+
         if self._deferred_task and not self._deferred_task.done():
             self._deferred_task.cancel()
             try:
                 await self._deferred_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # 必須在 super().close() 之前做：那之後 HTTP 連線就關了，sync 會失敗
+        if CLEAR_COMMANDS_ON_EXIT and not self.is_closed():
+            await self._clear_all_commands()
+
         if self._session:
             await self._session.close()
             self._session = None
         await super().close()
+
+    async def _clear_all_commands(self):
+        """把 Discord 上的斜線指令全部刪掉（含全域與各伺服器）。
+
+        Discord 的指令是常駐的，bot 下線後仍會出現在列表裡；
+        要實現「離線就看不到指令」，只能在退出前主動清空。
+        """
+        if not self.is_ready():
+            return          # 沒真的登入過，沒有東西要清
+        try:
+            await asyncio.wait_for(self._do_clear_all_commands(), timeout=25)
+        except asyncio.TimeoutError:
+            log.warning("⚠️ 移除斜線指令逾時，可能還有殘留")
+        except Exception as exc:
+            log.warning(f"⚠️ 移除斜線指令失敗: {exc}")
+
+    async def _do_clear_all_commands(self):
+        for guild in list(self.guilds):
+            obj = discord.Object(id=guild.id)
+            try:
+                self.tree.clear_commands(guild=obj)
+                await self.tree.sync(guild=obj)
+                log.info(f"🧹 已移除 {guild.name} 的斜線指令")
+            except Exception as exc:
+                log.warning(f"移除 {guild.name} 的斜線指令失敗: {exc}")
+
+        try:
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            log.info("🧹 已移除全域斜線指令")
+        except Exception as exc:
+            log.warning(f"移除全域斜線指令失敗: {exc}")
+
+        self._synced_guilds.clear()
 
     async def _sync_guild_commands(self, guilds=None):
         """把本地指令樹同步到伺服器。
@@ -1546,7 +1696,21 @@ class DCListener(discord.Client):
             await self._send_to_discord("防禦系統", f"🔨 **封禁事件**\n`{_clip(text, 500)}`")
 
     async def on_mc_tp(self, text: str):
-        match = re.search(r"(?:名稱|名称|xuid|玩家)\s*[:：]?\s*([A-Za-z0-9_ ]{2,24})", text)
+        # 外掛橫幅在 _dispatch 已經濾掉了，這裡再擋一次（舊 DLL 可能還在送）
+        if is_tp_banner(text):
+            return
+
+        # 去重鍵：把括號裡的網域/雜訊去掉，同一類提示只發一次
+        key = re.sub(r"[\(（].*?[\)）]", "", text).strip().lower()[:40]
+        now = time.monotonic()
+        if now - self._tp_alert_at.get(key, 0) < TP_ALERT_COOLDOWN:
+            log.debug(f"TP 提示在冷卻期內，略過: {text[:60]}")
+            return
+        self._tp_alert_at[key] = now
+        if len(self._tp_alert_at) > 50:
+            self._tp_alert_at = {key: now}
+
+        match = re.search(r"(?:名稱|名称|xuid|玩家)\s*[:：]?\s*([A-Za-z0-9_]{2,16})", text)
         lines = ["🛑 **偵測到 TP 平台特徵**"]
         if match:
             lines.append(f"目標：**{match.group(1).strip()}**")
@@ -1557,6 +1721,10 @@ class DCListener(discord.Client):
 
     async def on_mc_tp_join(self, player: str):
         """偵測到 TP 平台拉人：報告 + 直接踢出（TP_KICK 可關）。"""
+        if not valid_player_name(player):
+            log.warning(f"🚫 TP 事件的名字不像玩家名，直接忽略: {player[:32]!r}")
+            return
+
         now = time.monotonic()
         last = self._tp_kicked.get(player.lower(), 0)
         if now - last < TP_KICK_COOLDOWN:
@@ -1608,7 +1776,8 @@ class DCListener(discord.Client):
         log.info("🔴 橋接程式已斷線")
 
     # ------------------------------------------------ 踢人
-    async def send_game_command(self, cmd: str, label: str = "", timeout: float = 8.0) -> str:
+    async def send_game_command(self, cmd: str, label: str = "", timeout: float = 8.0,
+                                player: str = "") -> str:
         """送指令給遊戲。WebSocket 沒連線就排隊，等連上再送。
 
         以前沒連線時會退回「鍵盤注入」，但那需要遊戲在前景、而且只保證按鍵打出去，
@@ -1625,7 +1794,8 @@ class DCListener(discord.Client):
             log.warning(f"⏳ 指令佇列已滿（{KICK_QUEUE_MAX}），丟棄: {label}")
             return "（佇列已滿，未執行）"
 
-        self._deferred.append(DeferredCmd(cmd=cmd, label=label, created=time.monotonic()))
+        self._deferred.append(DeferredCmd(cmd=cmd, label=label,
+                                          created=time.monotonic(), player=player))
         log.warning(f"⏳ 遊戲 WebSocket 未連線，已排隊 #{len(self._deferred)}: {label}")
         return "⏳ 遊戲 WebSocket 未連線，已排入佇列，連上後自動執行"
 
@@ -1633,8 +1803,11 @@ class DCListener(discord.Client):
         if not ENABLE_COMMAND:
             log.warning("ENABLE_COMMAND=false，略過 kick")
             return "（指令傳送已停用）"
+        if not valid_player_name(player):
+            log.warning(f"🚫 拒絕踢出不合法的名字: {player[:32]!r}")
+            return "（名字不像玩家，已忽略）"
         cmd = f'kick "{player}" §c{reason}'
-        return await self.send_game_command(cmd, f"踢出 {player}（{reason}）")
+        return await self.send_game_command(cmd, f"踢出 {player}（{reason}）", player=player)
 
     async def _deferred_worker(self):
         """等遊戲 WebSocket 連上後，依序補送排隊的指令。"""
@@ -1660,6 +1833,20 @@ class DCListener(discord.Client):
                     continue
 
                 item = self._deferred.popleft()
+
+                # 補送前先確認這個人還在線上：離開了的玩家會讓遊戲回
+                # 「沒有與選擇器匹配的目標」，看起來像 bot 在踢不存在的人
+                if item.player and self.mc.players:
+                    online = {p.lower() for p in self.mc.players}
+                    if item.player.lower() not in online:
+                        log.info(f"⌛ {item.player} 已不在線上，作廢排隊指令")
+                        await self._send_to_discord(
+                            "防禦系統",
+                            f"⌛ **排隊指令已作廢**\n{item.label}\n"
+                            f"（{item.player} 已經不在遊戲裡了）",
+                        )
+                        continue
+
                 waited = int(now - item.created)
                 result = await self.mc.send_command(item.cmd, timeout=8)
                 log.info(f"🎮 補送排隊指令（等了 {waited}s）{item.label} → {result or '（無回應）'}")
@@ -1967,6 +2154,18 @@ class DCListener(discord.Client):
         self._synced_guilds.clear()
         await self._sync_guild_commands()
         await interaction.followup.send("✅ 已重新同步斜線指令", ephemeral=True)
+
+    @app_commands.command(name="shutdown", description="關閉 bot（斜線指令會一併消失）")
+    async def slash_shutdown(self, interaction: discord.Interaction):
+        if not self._is_guild_admin(interaction):
+            return await self._deny(interaction, "❌ 需要管理員權限")
+
+        await interaction.response.send_message(
+            "🛑 **正在關閉**\n會先移除斜線指令再下線；下次要上線請跑 `start.bat`。",
+            ephemeral=True,
+        )
+        await asyncio.sleep(0.6)      # 先讓這則訊息送出去，再開始拆連線
+        await self.request_shutdown()
 
     @app_commands.command(name="wl", description="白名單管理")
     @app_commands.describe(action="操作", user="Discord 使用者 ID 或名稱")
@@ -2466,27 +2665,107 @@ async def _run():
         # 3001 被別的程式占用時，只是沒有 HTTP 封禁 API，不該拖垮整個 bot
         log.warning(f"⚠️ Ban API 啟動失敗（port {BAN_API_PORT} 被占用？）: {exc}")
 
+    # Ctrl+C / SIGTERM 也要走「優雅關閉」，否則來不及移除斜線指令
+    stop_event = asyncio.Event()
+
+    def _handle_signal(*_args):
+        if bot._shutdown_requested:
+            log.warning("⌨️ 再次中斷，強制結束")
+            os._exit(1)
+        log.info("⌨️ 收到中斷訊號，準備優雅關閉")
+        stop_event.set()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            pass                      # 非主執行緒等情況維持預設行為
+
+    start_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
+    stop_task = asyncio.create_task(stop_event.wait())
     try:
-        await bot.start(DISCORD_TOKEN)
-    except discord.LoginFailure:
-        log.error("❌ Discord 登入失敗：DISCORD_TOKEN 無效或已被重置，請到 Developer Portal 重新複製")
-        await bot.close()
-        return
-    except discord.PrivilegedIntentsRequired:
-        log.error("❌ 缺少特權 Intent：請到 Developer Portal → Bot → 開啟 MESSAGE CONTENT INTENT")
-        await bot.close()
-        return
+        await asyncio.wait({start_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if start_task.done():
+            exc = start_task.exception()
+            if isinstance(exc, discord.LoginFailure):
+                log.error("❌ Discord 登入失敗：DISCORD_TOKEN 無效或已被重置，請到 Developer Portal 重新複製")
+            elif isinstance(exc, discord.PrivilegedIntentsRequired):
+                log.error("❌ 缺少特權 Intent：請到 Developer Portal → Bot → 開啟 MESSAGE CONTENT INTENT")
+            elif exc is not None:
+                log.error(f"❌ Discord 連線異常: {exc!r}")
+
+        if not start_task.done():
+            bot._shutdown_requested = True      # 訊號觸發，算「主動停止」
+        if not bot.is_closed():
+            await bot.close()
     finally:
+        stop_task.cancel()
+        if not start_task.done():
+            start_task.cancel()
+        try:
+            await start_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
         log.info("🛑 正在關閉...")
         ws_task.cancel()
         try:
             await ws_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
         await mc.stop()
         if api_runner is not None:
             await api_runner.cleanup()
         await miaaoo.close()
+
+        # 告訴 run_bot.bat「這次是使用者主動停的，不要自動重啟」
+        if bot._shutdown_requested:
+            try:
+                STOP_FLAG.write_text(str(int(time.time())), encoding="utf-8")
+                log.info("📛 已標記主動停止，run_bot.bat 不會自動重啟")
+            except OSError as exc:
+                log.warning(f"無法寫入停止標記: {exc}")
+
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is not None:
+                try:
+                    signal.signal(sig, signal.SIG_DFL)
+                except (ValueError, OSError):
+                    pass
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.3)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _cli_stop() -> None:
+    """`python bot.py --stop`：請正在跑的實例優雅關閉（含移除斜線指令）。"""
+    url = f"http://127.0.0.1:{BAN_API_PORT}/shutdown"
+    print(f"[stop] 請求 {url} …")
+    try:
+        req = urllib.request.Request(
+            url, data=b"{}", method="POST",
+            headers={"X-Api-Key": BAN_API_KEY, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print("[stop]", resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        print(f"[stop] 連不上執行中的 bot（可能沒在跑）: {exc}")
+        return
+
+    for _ in range(30):
+        time.sleep(0.5)
+        if not _port_open(LOCK_PORT):
+            print("[stop] bot 已停止，斜線指令已從 Discord 移除")
+            return
+    print("[stop] ⚠️ bot 還在關閉中，稍等一下（或直接關掉視窗）")
 
 
 def _acquire_single_instance() -> Optional[socket.socket]:
@@ -2508,6 +2787,18 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    # python bot.py --stop：不打單實例鎖，直接把正在跑的那份請下線
+    if "--stop" in sys.argv or "-stop" in sys.argv:
+        _cli_stop()
+        return
+
+    # 清掉上一次留下的「主動停止」標記
+    try:
+        if STOP_FLAG.exists():
+            STOP_FLAG.unlink()
+    except OSError:
+        pass
 
     lock = _acquire_single_instance()
     if lock is None:
