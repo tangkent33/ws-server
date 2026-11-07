@@ -127,7 +127,7 @@ BOT_STARTED_AT = time.time()                                # 讀不到遊戲進
 TP_BAN_MINUTES = _env_int("TP_BAN_MINUTES", 0)              # 0 = 永久
 TP_AUTO_BLACKLIST = _env_bool("TP_AUTO_BLACKLIST")
 ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
-# 外部封禁名單（BAN_RECORDS_API_BASE，如 acz.cc.cd）命中時是否直接踢出（預設開）
+# 外部封禁名單（BAN_RECORDS_API_BASE）命中時是否直接踢出（預設開）
 ENFORCE_EXTERNAL_BAN_ON_JOIN = _env_bool("ENFORCE_EXTERNAL_BAN_ON_JOIN", "true")
 
 # 偵測到 TP 平台拉人時：直接踢出（預設開）
@@ -2892,7 +2892,7 @@ class DCListener(discord.Client):
             )
             return
 
-        # 2) 外部封禁名單（BAN_RECORDS_API_BASE，如 acz.cc.cd）：命中直接踢
+        # 2) 外部封禁名單（BAN_RECORDS_API_BASE）：命中直接踢
         if not ENFORCE_EXTERNAL_BAN_ON_JOIN:
             return
         ext = await self.ban_records.lookup(player)
