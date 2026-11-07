@@ -1,0 +1,23 @@
+# 憑證：這個檔案含 Discord Token 與 Webhook，絕對不要提交
+.env
+.env.*
+
+# 本地工具資料（WorkBuddy 的工作記錄，不屬於專案）
+.workbuddy/
+
+# 執行期產物
+bot.log
+bot.log.*
+*.log
+cmdlog.txt
+__pycache__/
+*.pyc
+
+# 編譯中間檔
+*.obj
+*.lib
+*.exp
+
+# 每次啟動都會生成新檔名的注入副本
+827dll_*.dll
+827dll.old.dll
