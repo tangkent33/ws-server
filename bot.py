@@ -149,6 +149,10 @@ CLEAR_COMMANDS_ON_EXIT = _env_bool("CLEAR_COMMANDS_ON_EXIT", "true")
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")
 
+# 網頁控制面板（HTML GUI，exe 也連這裡）：http://127.0.0.1:8080
+GUI_PORT = _env_int("GUI_PORT", 8080)
+GUI_HTML = BASE_DIR / "gui.html"
+
 # ------------------------------------------------------------------ 事件開關
 ENABLE_JOIN_LEAVE = _env_bool("ENABLE_JOIN_LEAVE", "true")
 ENABLE_DEATH = _env_bool("ENABLE_DEATH", "true")
@@ -1157,6 +1161,136 @@ async def start_ban_api(bot: "DCListener", store: BanStore) -> web.AppRunner:
     site = web.TCPSite(runner, "127.0.0.1", BAN_API_PORT)
     await site.start()
     log.info(f"✅ Ban API 已啟動 http://127.0.0.1:{BAN_API_PORT} (x-api-key: {BAN_API_KEY})")
+    return runner
+
+
+async def start_gui(bot: "DCListener", blacklist: BanStore) -> web.AppRunner:
+    """網頁控制面板（HTML GUI）：http://127.0.0.1:GUI_PORT
+
+    只綁 127.0.0.1，給本機瀏覽器 / 打包好的 exe 用，不另外要求 API key。
+    頁面本體讀專案根目錄的 gui.html（改了存檔、重新整理就生效，不用重啟 bot）。
+    """
+    _GUI_FALLBACK = ("<!doctype html><meta charset=\"utf-8\"><title>MC 橋接面板</title>"
+                     "<body style=\"font-family:system-ui;padding:2rem;background:#111;color:#eee\">"
+                     "<h1>gui.html 遺失</h1><p>請把 gui.html 放回專案根目錄再重新整理。</p>")
+
+    def _tail(path: Path, n: int) -> list:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            return [ln.rstrip("\n") for ln in lines[-n:]]
+        except OSError:
+            return []
+
+    async def index(_req: web.Request):
+        try:
+            html = GUI_HTML.read_text(encoding="utf-8")
+        except OSError:
+            html = _GUI_FALLBACK
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+    async def state(_req: web.Request):
+        ban_records = None
+        try:
+            ban_records, _note = await bot.ban_records.count()
+        except Exception:
+            pass
+        board_text = ""
+        try:
+            board_text = bot.board.render()
+        except Exception:
+            pass
+        return web.json_response({
+            "version": __version__,
+            "discord_ready": bot.is_ready(),
+            "in_world": bot._in_world,
+            "mc_connected": bool(bot.mc.game_clients()),
+            "players": sorted(bot.mc.players),
+            "online": len(bot.mc.players),
+            "max_players": getattr(bot.board, "_max_players", None),
+            "seen": len(bot._seen_players),
+            "uptime": int(bot.board.uptime_seconds()),
+            "banned": len(blacklist.items()),
+            "ban_records": ban_records,
+            "channels": len(bot.config.channel_ids),
+            "statusboard": board_text,
+            "deferred": len(bot._deferred),
+        })
+
+    async def log_tail(request: web.Request):
+        n = max(1, min(int(request.query.get("n", "120")), 500))
+        return web.json_response({"lines": _tail(BASE_DIR / "bot.log", n)})
+
+    async def cmd(request: web.Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "body 必須是 JSON"}, status=400)
+        c = str((data or {}).get("cmd") or "").strip()
+        if not c:
+            return web.json_response({"error": "要填 cmd"}, status=400)
+        result = await bot.send_game_command(c, f"[GUI] {c}", timeout=12)
+        return web.json_response({"ok": True, "result": result})
+
+    async def kick(request: web.Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "body 必須是 JSON"}, status=400)
+        player = str((data or {}).get("player") or "").strip()
+        reason = str((data or {}).get("reason") or "由面板踢出").strip()
+        if not player:
+            return web.json_response({"error": "要填 player"}, status=400)
+        result = await bot.kick_player(player, reason)
+        return web.json_response({"ok": True, "result": result})
+
+    async def ban(request: web.Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "body 必須是 JSON"}, status=400)
+        name = str((data or {}).get("player") or "").strip()
+        reason = str((data or {}).get("reason") or "未填理由").strip()
+        if not name:
+            return web.json_response({"error": "要填 player"}, status=400)
+        try:
+            minutes = int((data or {}).get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        rec = blacklist.ban(name, reason, minutes, "gui")
+        _spawn(bot.kick_player(name, rec["reason"]))
+        return web.json_response({"ok": True, "player": name, **rec})
+
+    async def unban(request: web.Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "body 必須是 JSON"}, status=400)
+        name = str((data or {}).get("player") or "").strip()
+        if not name:
+            return web.json_response({"error": "要填 player"}, status=400)
+        return web.json_response({"ok": blacklist.unban(name), "player": name})
+
+    async def shutdown(_req: web.Request):
+        _spawn(bot.request_shutdown())
+        return web.json_response({"ok": True, "message": "正在關閉"})
+
+    app = web.Application()
+    app.add_routes([
+        web.get("/", index),
+        web.get("/state", state),
+        web.get("/log", log_tail),
+        web.post("/cmd", cmd),
+        web.post("/kick", kick),
+        web.post("/ban", ban),
+        web.post("/unban", unban),
+        web.post("/shutdown", shutdown),
+    ])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", GUI_PORT)
+    await site.start()
+    log.info(f"🖥️ 控制面板已啟動 http://127.0.0.1:{GUI_PORT}")
     return runner
 
 # ============================================================ 6. Miaaoo 聯機大廳 API
@@ -3549,6 +3683,12 @@ async def _run():
         # 3001 被別的程式占用時，只是沒有 HTTP 封禁 API，不該拖垮整個 bot
         log.warning(f"⚠️ Ban API 啟動失敗（port {BAN_API_PORT} 被占用？）: {exc}")
 
+    gui_runner = None
+    try:
+        gui_runner = await start_gui(bot, blacklist)
+    except OSError as exc:
+        log.warning(f"⚠️ 控制面板啟動失敗（port {GUI_PORT} 被占用？）: {exc}")
+
     # Ctrl+C / SIGTERM 也要走「優雅關閉」，否則來不及移除斜線指令
     stop_event = asyncio.Event()
 
@@ -3604,6 +3744,8 @@ async def _run():
         await mc.stop()
         if api_runner is not None:
             await api_runner.cleanup()
+        if gui_runner is not None:
+            await gui_runner.cleanup()
         await miaaoo.close()
 
         # 告訴 run_bot.bat「這次是使用者主動停的，不要自動重啟」

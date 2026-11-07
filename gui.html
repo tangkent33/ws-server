@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MC 聊天橋接 · 控制台</title>
+<style>
+  :root {
+    --titlebar:#23272e; --bg:#2b2f36; --panel:#333843; --panel2:#3c414d; --line:#464c58;
+    --text:#e8eaed; --muted:#9aa3b2; --accent:#4f8cff; --accent2:#37d0a5;
+    --red:#e5534b; --amber:#e0a63c; --green:#4caf70;
+    --mono:"Consolas","Courier New",monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    margin:0; background:#1b1e24; display:flex; align-items:center; justify-content:center;
+    font:13px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; color:var(--text);
+  }
+  .window {
+    width:100vw; height:100vh; max-width:1080px; max-height:92vh;
+    background:var(--bg); border:1px solid #0f1115; border-radius:10px;
+    box-shadow:0 18px 50px rgba(0,0,0,.55); display:flex; flex-direction:column; overflow:hidden;
+  }
+  .titlebar { height:38px; flex:0 0 38px; display:flex; align-items:center; gap:10px;
+    padding:0 12px; background:var(--titlebar); border-bottom:1px solid #1a1d23; user-select:none; }
+  .titlebar .appicon { font-size:15px; }
+  .titlebar .title { font-size:13px; font-weight:600; letter-spacing:.4px; }
+  .titlebar .sub { color:var(--muted); font-size:11px; }
+  .winbtns { margin-left:auto; display:flex; gap:8px; }
+  .winbtns span { width:26px; height:22px; display:grid; place-items:center; border-radius:6px;
+    cursor:pointer; color:var(--muted); font-size:13px; }
+  .winbtns span:hover { background:#343a45; color:#fff; }
+  .winbtns .close:hover { background:var(--red); }
+
+  .toolbar { flex:0 0 40px; display:flex; align-items:center; gap:6px; padding:0 10px;
+    background:var(--panel); border-bottom:1px solid var(--line); }
+  .toolbar button { border:1px solid transparent; background:transparent; color:var(--text);
+    padding:5px 10px; border-radius:6px; cursor:pointer; font-size:12.5px; }
+  .toolbar button:hover { background:var(--panel2); border-color:var(--line); }
+  .toolbar .sep { width:1px; height:20px; background:var(--line); margin:0 4px; }
+
+  .body { flex:1; display:flex; min-height:0; }
+  .sidebar { width:168px; flex:0 0 168px; background:var(--panel); border-right:1px solid var(--line);
+    padding:8px; display:flex; flex-direction:column; gap:2px; }
+  .sidebar .nav { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:7px;
+    cursor:pointer; color:var(--muted); font-size:13px; }
+  .sidebar .nav:hover { background:var(--panel2); color:var(--text); }
+  .sidebar .nav.active { background:var(--accent); color:#fff; font-weight:600; }
+  .sidebar .brand { margin-top:auto; color:#5b6472; font-size:11px; padding:10px; line-height:1.5; }
+
+  .content { flex:1; padding:16px; overflow:auto; min-width:0; }
+  .pane { display:none; } .pane.active { display:block; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:14px 16px; margin-bottom:14px; }
+  .panel h3 { margin:0 0 12px; font-size:12px; color:var(--muted); font-weight:600;
+    text-transform:uppercase; letter-spacing:.6px; }
+
+  .chips { display:flex; gap:12px; flex-wrap:wrap; }
+  .chip { display:inline-flex; align-items:center; gap:7px; padding:6px 12px; border-radius:999px;
+    background:var(--panel2); border:1px solid var(--line); }
+  .chip .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); }
+  .chip.good .dot { background:var(--green); }
+  .chip.bad .dot { background:var(--red); }
+  .chip.warn .dot { background:var(--amber); }
+
+  .stats { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; }
+  .stat { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .stat .k { color:var(--muted); font-size:11.5px; }
+  .stat .v { font-size:19px; font-weight:600; margin-top:2px; }
+  .stat .v.accent { color:var(--accent2); }
+
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.5px; }
+  tbody tr:hover { background:var(--panel2); }
+  .btn { border:0; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px; color:#fff; }
+  .btn.kick { background:var(--amber); }
+  .btn.ban { background:var(--red); }
+  .btn.primary { background:var(--accent); }
+  .btn.ghost { background:var(--panel2); border:1px solid var(--line); color:var(--text); }
+
+  .cmdrow { display:flex; gap:8px; }
+  .cmdrow input { flex:1; background:var(--panel2); border:1px solid var(--line); color:var(--text);
+    border-radius:6px; padding:8px 10px; font-size:13px; outline:none; }
+  .cmdrow input:focus { border-color:var(--accent); }
+  #result { margin-top:10px; white-space:pre-wrap; font-family:var(--mono); background:var(--panel2);
+    border:1px solid var(--line); border-radius:8px; padding:10px; max-height:160px; overflow:auto; font-size:12.5px; }
+
+  .console { background:#15181d; border:1px solid var(--line); border-radius:8px; height:320px;
+    overflow-y:auto; padding:10px 12px; font-family:var(--mono); font-size:12px; line-height:1.6; white-space:pre-wrap; }
+  .console .warn { color:var(--amber); } .console .err { color:var(--red); }
+  .console .ok { color:var(--green); } .console .cmd { color:var(--accent); }
+  .console .ts { color:#5b6472; }
+
+  .statusline { flex:0 0 26px; display:flex; align-items:center; gap:14px; padding:0 12px;
+    background:var(--titlebar); border-top:1px solid #1a1d23; font-size:11.5px; color:var(--muted); }
+
+  .offline { position:fixed; top:16px; left:50%; transform:translateX(-50%); z-index:99;
+    background:#7a2a2a; color:#fff; padding:8px 16px; border-radius:8px; font-size:13px; display:none; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="window">
+  <div class="titlebar">
+    <span class="appicon">🕹️</span>
+    <span class="title">MC 聊天橋接控制台</span>
+    <span class="sub" id="ver">—</span>
+    <div class="winbtns">
+      <span title="最小化">—</span><span title="最大化">▢</span><span class="close" title="關閉">✕</span>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button id="btn-refresh">🔄 重新整理</button>
+    <span class="sep"></span>
+    <button id="btn-shutdown">🛑 關閉 bot</button>
+  </div>
+
+  <div class="body">
+    <aside class="sidebar">
+      <div class="nav active" data-pane="overview"><span>📊</span> 概況</div>
+      <div class="nav" data-pane="players"><span>👥</span> 在線玩家</div>
+      <div class="nav" data-pane="command"><span>⌨️</span> 執行指令</div>
+      <div class="nav" data-pane="log"><span>📜</span> 記錄</div>
+      <div class="brand">連線 127.0.0.1<br>即時資料</div>
+    </aside>
+
+    <div class="content">
+      <section class="pane active" id="pane-overview">
+        <div class="panel">
+          <h3>連線狀態</h3>
+          <div class="chips">
+            <span class="chip" id="c-discord"><span class="dot"></span><span>Discord</span></span>
+            <span class="chip" id="c-mc"><span class="dot"></span><span>橋接器</span></span>
+            <span class="chip" id="c-world"><span class="dot"></span><span>世界</span></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>概況</h3>
+          <div class="stats">
+            <div class="stat"><div class="k">在線 / 上限</div><div class="v accent" id="st-online">—</div></div>
+            <div class="stat"><div class="k">已加入人次</div><div class="v" id="st-seen">—</div></div>
+            <div class="stat"><div class="k">運行時間</div><div class="v" id="st-uptime">—</div></div>
+            <div class="stat"><div class="k">本地封禁</div><div class="v" id="st-banned">—</div></div>
+            <div class="stat"><div class="k">封禁紀錄</div><div class="v" id="st-records">—</div></div>
+            <div class="stat"><div class="k">轉發頻道</div><div class="v" id="st-channels">—</div></div>
+            <div class="stat"><div class="k">指令佇列</div><div class="v" id="st-deferred">—</div></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>狀態列</h3>
+          <div id="board">載入中…</div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-players">
+        <div class="panel">
+          <h3>在線玩家 <span class="muted" id="player-count"></span></h3>
+          <table>
+            <thead><tr><th>玩家</th><th style="width:130px">操作</th></tr></thead>
+            <tbody id="player-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-command">
+        <div class="panel">
+          <h3>執行 Minecraft 指令</h3>
+          <div class="cmdrow">
+            <input type="text" id="cmd-input" placeholder="例如：time set day　／　say 大家好　／　weather clear" autocomplete="off">
+            <button class="btn primary" id="cmd-run">執行</button>
+          </div>
+          <div style="margin-top:10px; display:flex; gap:6px; flex-wrap:wrap">
+            <button class="btn ghost" data-quick="time set day">白天</button>
+            <button class="btn ghost" data-quick="time set night">黑夜</button>
+            <button class="btn ghost" data-quick="weather clear">晴天</button>
+            <button class="btn ghost" data-quick="weather rain">下雨</button>
+            <button class="btn ghost" data-quick="seed">看種子</button>
+          </div>
+          <div id="result" style="display:none"></div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-log">
+        <div class="panel">
+          <h3>控制台記錄（bot.log）</h3>
+          <div class="console" id="console"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="statusline">
+    <span id="sl-status">連線中…</span><span>|</span>
+    <span id="sl-online">在線 —</span><span>|</span><span id="clock">--:--:--</span>
+  </div>
+</div>
+
+<div class="offline" id="offline">連不上 bot（請先跑 start.bat，確認 127.0.0.1 面板已啟動）</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function fmtUptime(s) {
+  if (s == null) return "—";
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return `${d}天 ${h}時 ${m}分`;
+  if (h) return `${h}時 ${m}分`;
+  return `${m}分 ${Math.floor(s%60)}秒`;
+}
+function setChip(el, state) {
+  el.classList.remove("good","bad","warn");
+  el.classList.add(state === true ? "good" : (state === false ? "bad" : "warn"));
+}
+async function jfetch(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function refreshState() {
+  try {
+    const s = await jfetch("/state");
+    $("offline").style.display = "none";
+    $("ver").textContent = "v" + s.version;
+
+    setChip($("c-discord"), s.discord_ready);
+    setChip($("c-mc"), s.mc_connected);
+    setChip($("c-world"), s.in_world);
+    $("c-discord").querySelector("span:last-child").textContent = s.discord_ready ? " Discord 已連線" : " Discord 未連線";
+    $("c-mc").querySelector("span:last-child").textContent = s.mc_connected ? " 橋接器 已連線" : " 橋接器 未連線";
+    $("c-world").querySelector("span:last-child").textContent = s.in_world === null ? " 世界(未知)"
+      : (s.in_world ? " 世界中" : " 未進入世界");
+
+    $("board").textContent = s.statusboard || "—";
+    $("st-online").textContent = `${s.online} / ${s.max_players ?? "?"}`;
+    $("st-seen").textContent = s.seen;
+    $("st-uptime").textContent = fmtUptime(s.uptime);
+    $("st-banned").textContent = s.banned;
+    $("st-records").textContent = s.ban_records ?? "未連線";
+    $("st-channels").textContent = s.channels;
+    $("st-deferred").textContent = s.deferred;
+
+    $("sl-status").textContent = s.mc_connected ? "就緒" : "橋接器未連線";
+    $("sl-online").textContent = "在線 " + s.online + " 人";
+
+    renderPlayers(s.players);
+  } catch (e) {
+    $("offline").style.display = "block";
+    $("sl-status").textContent = "未連線";
+    $("board").textContent = "連不上 bot";
+  }
+}
+
+function renderPlayers(list) {
+  const tbody = $("player-rows");
+  $("player-count").textContent = list.length ? `(${list.length})` : "";
+  tbody.innerHTML = "";
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td class="muted">沒有在線玩家</td><td></td></tr>';
+    return;
+  }
+  for (const p of list) {
+    const tr = document.createElement("tr");
+    const tdName = document.createElement("td"); tdName.textContent = p;
+    const tdOp = document.createElement("td");
+    const kb = document.createElement("button"); kb.className = "btn kick"; kb.textContent = "踢出";
+    kb.onclick = () => kick(p);
+    const bb = document.createElement("button"); bb.className = "btn ban"; bb.textContent = "封禁";
+    bb.style.marginLeft = "6px"; bb.onclick = () => ban(p);
+    tdOp.append(kb, bb);
+    tr.append(tdName, tdOp);
+    tbody.appendChild(tr);
+  }
+}
+
+function showResult(text) { const r = $("result"); r.style.display = "block"; r.textContent = text; }
+
+async function sendCmd(cmd) {
+  $("cmd-input").value = cmd;
+  showResult("⏳ 送出中…");
+  try {
+    const res = await jfetch("/cmd", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({cmd}) });
+    showResult(res.result ?? JSON.stringify(res));
+  } catch (e) { showResult("❌ 請求失敗：" + e); }
+}
+async function kick(p) {
+  const reason = prompt(`踢出 ${p}？理由：`, "由面板踢出");
+  if (reason === null) return;
+  try { const r = await jfetch("/kick", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({player:p, reason})}); showResult(r.result ?? JSON.stringify(r)); refreshState(); }
+  catch(e){ showResult("❌ "+e); }
+}
+async function ban(p) {
+  const reason = prompt(`封禁 ${p}？理由：`, "由面板封禁");
+  if (reason === null) return;
+  const min = prompt("封禁分鐘數（0 = 永久）：", "0");
+  try { const r = await jfetch("/ban", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({player:p, reason, minutes:parseInt(min||"0",10)})});
+    showResult(r.ok ? `✅ 已封禁 ${p}` : JSON.stringify(r)); refreshState(); }
+  catch(e){ showResult("❌ "+e); }
+}
+
+async function refreshLog() {
+  try {
+    const d = await jfetch("/log?n=200");
+    const el = $("console");
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+    let html = "";
+    for (const ln of (d.lines||[])) {
+      let cls = "";
+      if (/ERROR|❌|🔥/.test(ln)) cls = "err";
+      else if (/WARNING|⚠️|⏳/.test(ln)) cls = "warn";
+      else if (/✅|🟢|➕|OK/.test(ln)) cls = "ok";
+      else if (/^> /.test(ln)) cls = "cmd";
+      const esc = ln.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      html += `<div class="${cls}">${esc}</div>`;
+    }
+    el.innerHTML = html;
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  } catch (e) {}
+}
+
+function clock() {
+  const d = new Date();
+  $("clock").textContent = String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0");
+}
+setInterval(clock, 1000); clock();
+
+document.querySelectorAll(".sidebar .nav").forEach(n => n.onclick = () => {
+  document.querySelectorAll(".sidebar .nav").forEach(x=>x.classList.remove("active"));
+  document.querySelectorAll(".pane").forEach(p=>p.classList.remove("active"));
+  n.classList.add("active"); $("pane-"+n.dataset.pane).classList.add("active");
+});
+
+$("cmd-run").onclick = () => { const c = $("cmd-input").value.trim(); if (c) sendCmd(c); };
+$("cmd-input").addEventListener("keydown", e => { if (e.key==="Enter"){ const c=$("cmd-input").value.trim(); if(c) sendCmd(c);} });
+document.querySelectorAll("[data-quick]").forEach(b => b.onclick = () => sendCmd(b.dataset.quick));
+$("btn-refresh").onclick = () => { refreshState(); refreshLog(); };
+$("btn-shutdown").onclick = async () => {
+  if (!confirm("確定關閉 bot？斜線指令會被移除，要跑 start.bat 才會再上線。")) return;
+  try { await jfetch("/shutdown", {method:"POST"}); showResult("🛑 已送出關閉請求"); } catch(e){ showResult("❌ "+e); }
+};
+
+refreshState(); refreshLog();
+setInterval(refreshState, 2000);
+setInterval(refreshLog, 3000);
+</script>
+</body>
+</html>

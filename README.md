@@ -381,3 +381,22 @@ ws服务器\                 ← 本機執行用（start.bat 在這裡跑）
 - **`python cloud_sync.py --dry-run`**：只預覽會同步／刪除哪些檔案。
 - 要上傳的檔案清單寫在 `cloud_sync.py` 的 `FILES` / `SRC_DIRS`；
   不在清單裡的東西不會出現在 GitHub 上（`cloud\` 裡的殘留會被清掉）。
+
+## 桌面控制面板（GUI）
+
+bot 啟動後會另外開一個只綁本機的介面（`http://127.0.0.1:8080`），
+`gui.html` 是它的畫面（即時狀態、在線玩家、執行指令、踢人/封禁、bot.log）。
+用瀏覽器開 `http://127.0.0.1:8080` 就能用；想要獨立視窗（不是瀏覽器分頁），
+把它包成 exe：
+
+```bat
+build_gui.bat
+```
+
+會用 `pywebview` 把畫面做成原生視窗，再用 `pyinstaller` 打包成
+`dist\MC-Bridge-GUI.exe`。之後直接雙擊這個 exe 就是一個桌面程式，
+它連的還是本機 `127.0.0.1:8080`（所以 bot 要先跑起來）。
+
+- 端口可用 `.env` 的 `GUI_PORT` 改（預設 8080）
+- exe 只在「bot 正在跑」時才有資料；沒跑 start.bat 會顯示「連不上 bot」提示
+- `dist\`、`*.spec` 是打包產物，不進 git
