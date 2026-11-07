@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.9"
+__version__ = "9.8.0"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -453,6 +453,15 @@ def parse_list_counts(raw: str) -> Tuple[int, int]:
     on = re.search(r"(\d+)\s*(?:名玩家|個玩家|名玩家|人在線)", raw)
     cap = re.search(r"(?:最多|上限|max)\s*[:：]?\s*(\d+)", raw, re.IGNORECASE)
     return (int(on.group(1)) if on else 0), (int(cap.group(1)) if cap else 0)
+
+def clean_result(value: Any) -> str:
+    """把逾時 / 例外 / 「只有 ACK」統一成空字串，避免被當成真的回覆顯示。"""
+    if value is None or isinstance(value, BaseException):
+        return ""
+    text = str(value).strip()
+    if text.startswith("⚠️") or text.startswith("（"):
+        return ""
+    return text
 
 def game_process_started_at() -> Optional[float]:
     """本機 Minecraft.Windows.exe 的啟動時間（世界運行時長的近似值）。
@@ -1750,10 +1759,6 @@ class MiaaooAPI:
         return status, msg or f"HTTP {status}"
 
 # ============================================================ 7. Discord 客戶端
-def is_admin(message: discord.Message) -> bool:
-    perms = getattr(message.author, "guild_permissions", None)
-    return bool(perms and getattr(perms, "administrator", False))
-
 @dataclass
 class DeferredCmd:
     """遊戲 WebSocket 沒連線時暫存的指令，連上後由 worker 補送。"""
@@ -2006,7 +2011,7 @@ class StatusBoard:
         if not self.client.mc.game_clients():
             return
         try:
-            raw = self.client._clean_result(
+            raw = clean_result(
                 await self.client.mc.send_command("list", timeout=6))
         except Exception as exc:
             log.debug(f"狀態列 seed 失敗: {exc}")
@@ -2275,11 +2280,7 @@ class DCListener(discord.Client):
 
     async def on_ready(self):
         log.info(f"✅ Discord 已登入：{self.user}")
-        if not self._session:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers={"User-Agent": f"DiscordBot (mc-bridge {__version__})"},
-            )
+        self._http_session()
         # 把「登入前」收到的遊戲事件補發出去
         await self._flush_dc_buffer()
 
@@ -2491,9 +2492,6 @@ class DCListener(discord.Client):
                 pass
 
     # ------------------------------------------------ 權限
-    def _check_perm(self, message: discord.Message) -> bool:
-        return is_admin(message) or self._authorized(message.author)
-
     def _authorized(self, author) -> bool:
         users = self.whitelist.users
         if str(getattr(author, "id", "")) in users:
@@ -2512,18 +2510,28 @@ class DCListener(discord.Client):
         return OWNER_ID in {str(getattr(user, "name", "") or ""),
                             str(getattr(user, "display_name", "") or "")}
 
-    def _require_admin(self, message: discord.Message) -> bool:
+    def _can_manage(self, user) -> bool:
         """管理員、白名單使用者、或 bot 擁有者。
 
-        以前只認伺服器管理員，導致在「自己不是管理員」的伺服器上
-        （例如別人的群）連 !sync / !wl 都會被擋成「需要管理員權限」。
+        文字指令與斜線指令統一走這一個判斷。以前文字指令用 _check_perm /
+        _require_admin、斜線指令用 _may_manage，三套判斷還不一致（有的漏掉
+        owner），在「自己不是管理員」的伺服器上會莫名被擋成「需要管理員權限」。
         """
-        perms = getattr(getattr(message.author, "guild_permissions", None), "administrator", False)
+        perms = getattr(getattr(user, "guild_permissions", None), "administrator", False)
         if perms:
             return True
-        return self._authorized(message.author) or self._is_owner(message.author)
+        return self._authorized(user) or self._is_owner(user)
 
     # ------------------------------------------------ 遊戲 → Discord
+    def _http_session(self) -> aiohttp.ClientSession:
+        """webhook 用的共用 HTTP session（登入時或第一次發 webhook 時建立）。"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": f"DiscordBot (mc-bridge {__version__})"},
+            )
+        return self._session
+
     async def _send_to_discord(self, username: str, content: str):
         text = _clip(content)
 
@@ -2546,11 +2554,7 @@ class DCListener(discord.Client):
                 log.error(f"發送到頻道 {cid} 失敗: {exc}")
 
         if self.webhook_url:
-            if not self._session:
-                self._session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=10),
-                    headers={"User-Agent": f"DiscordBot (mc-bridge {__version__})"},
-                )
+            session = self._http_session()
             try:
                 payload = {
                     "username": _clip(username, 80),
@@ -2558,7 +2562,7 @@ class DCListener(discord.Client):
                     "avatar_url": f"https://mc-heads.net/avatar/{username}/64",
                     "allowed_mentions": {"parse": []},
                 }
-                async with self._session.post(self.webhook_url, json=payload) as resp:
+                async with session.post(self.webhook_url, json=payload) as resp:
                     await resp.text()
             except Exception as exc:
                 log.debug(f"Webhook 發送失敗: {exc}")
@@ -2592,7 +2596,7 @@ class DCListener(discord.Client):
                 if not self.mc.game_clients():
                     continue
                 raw = await self.mc.send_command("list", timeout=8)
-                text = self._clean_result(raw or "")
+                text = clean_result(raw or "")
                 if text and looks_like_no_world(text):
                     # 房間關了：清掉殘留名單，狀態列改成「未進入世界」
                     if self._in_world is not False:
@@ -2923,16 +2927,36 @@ class DCListener(discord.Client):
         await self._send_to_discord("防禦系統", f"⚠️ **指令沒有成功**\n原因: `{detail}`")
 
     # ------------------------------------------------ 斜線指令：共用
-    def _may_manage(self, interaction: discord.Interaction) -> bool:
-        """管理員，或白名單使用者，或 bot 擁有者。"""
-        perms = getattr(interaction.user, "guild_permissions", None)
-        if perms and perms.administrator:
-            return True
-        return self._authorized(interaction.user) or self._is_owner(interaction.user)
+    async def _query_world(self) -> Tuple[str, str, str, str, List[str]]:
+        """一次併發查 list / time / weather / seed。
 
-    def _is_guild_admin(self, interaction: discord.Interaction) -> bool:
-        perms = getattr(interaction.user, "guild_permissions", None)
-        return bool(perms and perms.administrator)
+        回傳 (list_raw, time_raw, weather_raw, seed_raw, players)。
+        以前 /check 與 !check 各寫一份一模一樣的併發查詢，現在共用。
+        """
+        results = await asyncio.gather(
+            self.mc.send_command("list", timeout=10),
+            self.mc.send_command("time query daytime", timeout=10),
+            self.mc.send_command("weather query", timeout=10),
+            self.mc.send_command("seed", timeout=10),
+            return_exceptions=True,
+        )
+        list_raw, time_raw, weather_raw, seed_raw = (clean_result(r) for r in results)
+        return list_raw, time_raw, weather_raw, seed_raw, extract_players(list_raw)
+
+    @staticmethod
+    def _format_ban_rows(items: List[dict], limit: int = 20) -> List[str]:
+        """把封禁名單轉成展示用的一行行文字（/banned 與 !banned 共用）。"""
+        rows: List[str] = []
+        for item in items[:limit]:
+            name = str(item.get("name") or "?")
+            reason = str(item.get("reason") or "")
+            until = item.get("until")
+            if until:
+                expiry = time.strftime("%m-%d %H:%M", time.localtime(until / 1000))
+                rows.append(f"`{name}` — {reason}（到 {expiry}）")
+            else:
+                rows.append(f"`{name}` — {reason}（永久）")
+        return rows
 
     @staticmethod
     async def _deny(interaction: discord.Interaction,
@@ -3016,7 +3040,7 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="players", description="列出線上玩家")
     async def slash_players(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3024,7 +3048,7 @@ class DCListener(discord.Client):
         source = ""
         # 先問遊戲 `list`；拿不到有效回顯就退回事件快取（加入/離開事件累積的名單）
         if self.mc.game_clients():
-            raw = self._clean_result(await self.mc.send_command("list", timeout=6))
+            raw = clean_result(await self.mc.send_command("list", timeout=6))
             names = extract_players(raw)
             if names:
                 source = "遊戲回報（list）"
@@ -3041,7 +3065,7 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="check", description="檢查伺服器狀態（時間 / 天氣 / 種子）")
     async def slash_check(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3053,15 +3077,7 @@ class DCListener(discord.Client):
             await interaction.followup.send(embed=embed)
             return
 
-        results = await asyncio.gather(
-            self.mc.send_command("list", timeout=10),
-            self.mc.send_command("time query daytime", timeout=10),
-            self.mc.send_command("weather query", timeout=10),
-            self.mc.send_command("seed", timeout=10),
-            return_exceptions=True,
-        )
-        list_raw, time_raw, weather_raw, seed_raw = (self._clean_result(r) for r in results)
-        players = extract_players(list_raw)
+        list_raw, time_raw, weather_raw, seed_raw, players = await self._query_world()
 
         # 房間關掉以後，MC-WS 的 WebSocket 還連著（它不管你在不在世界裡），但遊戲
         # 會把每一個指令都用「未知的命令」打回來 —— 用這個判斷在不在世界裡，
@@ -3099,7 +3115,7 @@ class DCListener(discord.Client):
     @app_commands.command(name="cmd", description="在遊戲內執行 Minecraft 指令")
     @app_commands.describe(command="不用打斜線，例如 time set day")
     async def slash_cmd(self, interaction: discord.Interaction, command: str):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         cmd = normalize_cmd(command)
@@ -3124,7 +3140,7 @@ class DCListener(discord.Client):
     @app_commands.autocomplete(player=player_autocomplete)
     async def slash_kick(self, interaction: discord.Interaction, player: str,
                          reason: str = "由管理員踢出"):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3144,7 +3160,7 @@ class DCListener(discord.Client):
     @app_commands.autocomplete(player=player_autocomplete)
     async def slash_ban(self, interaction: discord.Interaction, player: str,
                         minutes: int = 0, reason: str = ""):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3167,7 +3183,7 @@ class DCListener(discord.Client):
     @app_commands.describe(player="玩家名稱")
     @app_commands.autocomplete(player=player_autocomplete)
     async def slash_unban(self, interaction: discord.Interaction, player: str):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         ok = self.blacklist.unban(player)
@@ -3178,7 +3194,7 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="banned", description="查看封禁名單")
     async def slash_banned(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         items = self.blacklist.items()
@@ -3186,14 +3202,7 @@ class DCListener(discord.Client):
             await interaction.response.send_message("📋 封禁名單是空的", ephemeral=True)
             return
 
-        lines = []
-        for item in items[:20]:
-            until = item.get("until")
-            if until:
-                expiry = time.strftime("%m-%d %H:%M", time.localtime(until / 1000))
-                lines.append(f"`{item['name']}` — {item.get('reason', '')}（到 {expiry}）")
-            else:
-                lines.append(f"`{item['name']}` — {item.get('reason', '')}（永久）")
+        lines = self._format_ban_rows(items)
         embed = discord.Embed(title=f"🔨 封禁名單（{len(items)}）",
                               description=_clip("\n".join(lines), 3900), color=0xEF4444)
         if len(items) > 20:
@@ -3205,7 +3214,7 @@ class DCListener(discord.Client):
 
     @statusboard.command(name="start", description="在目前頻道建立狀態列並開始自動刷新")
     async def board_start(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         channel = interaction.channel
@@ -3219,7 +3228,7 @@ class DCListener(discord.Client):
 
     @statusboard.command(name="stop", description="停止自動刷新並刪掉那條狀態訊息")
     async def board_stop(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
         if not self.board.channel_id:
             return await self._deny(interaction, "❌ 狀態列還沒啟動")
@@ -3229,7 +3238,7 @@ class DCListener(discord.Client):
 
     @statusboard.command(name="now", description="立刻刷新一次並顯示結果")
     async def board_now(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
         if not self.board.channel_id:
             return await self._deny(interaction, "❌ 狀態列還沒啟動，先用 `/statusboard start`")
@@ -3240,7 +3249,7 @@ class DCListener(discord.Client):
     # ------------------------------------------------ 斜線指令：設定
     @app_commands.command(name="settings", description="查看目前設定")
     async def slash_settings(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         guild = self.get_guild(self.config.guild_id) if self.config.guild_id else None
@@ -3262,7 +3271,7 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="sync", description="重新同步斜線指令（改版後用）")
     async def slash_sync(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(ephemeral=True)
@@ -3272,7 +3281,7 @@ class DCListener(discord.Client):
 
     @app_commands.command(name="shutdown", description="關閉 bot（斜線指令會一併消失）")
     async def slash_shutdown(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.send_message(
@@ -3291,7 +3300,7 @@ class DCListener(discord.Client):
     ])
     async def slash_wl(self, interaction: discord.Interaction,
                        action: app_commands.Choice[str], user: Optional[str] = None):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         if action.value == "list":
@@ -3319,7 +3328,7 @@ class DCListener(discord.Client):
     @lianji.command(name="list", description="查看聯機大廳房間列表")
     @app_commands.describe(lang="語言篩選：zh / en / ja，多個用逗號分隔；留空 = 全部")
     async def lianji_list(self, interaction: discord.Interaction, lang: str = ""):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3338,7 +3347,7 @@ class DCListener(discord.Client):
     @app_commands.describe(room="選擇房間（輸入關鍵字可搜尋）")
     @app_commands.autocomplete(room=room_autocomplete)
     async def lianji_info(self, interaction: discord.Interaction, room: str):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3381,7 +3390,7 @@ class DCListener(discord.Client):
         await interaction.followup.send(embed=embed)
 
     async def _join_flow(self, interaction: discord.Interaction, room: str):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3438,7 +3447,7 @@ class DCListener(discord.Client):
 
     @lianji.command(name="me", description="查看自己的 XUID / addid 與可用帳號")
     async def lianji_me(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3469,7 +3478,7 @@ class DCListener(discord.Client):
 
     @lianji.command(name="refresh", description="刷新後端粉絲快取（房間列表會更新）")
     async def lianji_refresh(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
+        if not self._can_manage(interaction.user):
             return await self._deny(interaction)
 
         await interaction.response.defer(thinking=True)
@@ -3504,7 +3513,7 @@ class DCListener(discord.Client):
         await message.reply(self._status_text())
 
     async def _cmd_sync(self, message: discord.Message):
-        if not self._check_perm(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 你沒有權限")
             return
         status = await message.reply("🔄 同步中...")
@@ -3513,7 +3522,7 @@ class DCListener(discord.Client):
         await status.edit(content="✅ 已同步斜線指令")
 
     async def _cmd_ban(self, message: discord.Message):
-        if not self._check_perm(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 你沒有權限")
             return
 
@@ -3536,7 +3545,7 @@ class DCListener(discord.Client):
         await message.reply(f"🔨 已封禁 **{name}**（{rec['reason']}）\n{result}")
 
     async def _cmd_unban(self, message: discord.Message):
-        if not self._check_perm(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 你沒有權限")
             return
         parts = message.content.strip().split()
@@ -3552,14 +3561,7 @@ class DCListener(discord.Client):
             await message.reply("封禁名單是空的")
             return
 
-        lines = []
-        for item in items[:20]:
-            until = item.get("until")
-            if until:
-                expiry = time.strftime("%m-%d %H:%M", time.localtime(until / 1000))
-                lines.append(f"`{item['name']}` — {item.get('reason', '')}（到 {expiry}）")
-            else:
-                lines.append(f"`{item['name']}` — {item.get('reason', '')}（永久）")
+        lines = self._format_ban_rows(items)
         suffix = f"\n...共 {len(items)} 筆" if len(items) > 20 else ""
         await message.reply(_clip("**封禁名單**\n" + "\n".join(lines) + suffix))
 
@@ -3572,7 +3574,7 @@ class DCListener(discord.Client):
             return
 
         raw = await self.mc.send_command("list", timeout=10)
-        players = extract_players(self._clean_result(raw))
+        players = extract_players(clean_result(raw))
         if players:
             await message.reply(f"**👥 線上玩家 ({len(players)})**\n```\n{', '.join(players)}\n```")
         else:
@@ -3588,16 +3590,7 @@ class DCListener(discord.Client):
 
         status = await message.reply("🔍 檢查中...")
         # 四條指令互相獨立，一次併發送出；以前逐條等 = 最慢 40 秒，現在一個 timeout 就結束
-        results = await asyncio.gather(
-            self.mc.send_command("list", timeout=10),
-            self.mc.send_command("time query daytime", timeout=10),
-            self.mc.send_command("weather query", timeout=10),
-            self.mc.send_command("seed", timeout=10),
-            return_exceptions=True,
-        )
-        list_raw, time_raw, weather_raw, seed_raw = (self._clean_result(r) for r in results)
-
-        players = extract_players(list_raw)
+        list_raw, time_raw, weather_raw, seed_raw, players = await self._query_world()
         lines = [
             f"🎮 連線: {'🟢' if self.mc.connected else '🔴'}",
             f"👑 房主: {OWNER_ID}",
@@ -3610,16 +3603,6 @@ class DCListener(discord.Client):
         if seed_raw:
             lines.append(f"🌍 種子: {seed_raw}")
         await status.edit(content=_clip("**📊 伺服器狀態**\n" + "\n".join(lines)))
-
-    @staticmethod
-    def _clean_result(value: Any) -> str:
-        """把逾時 / 例外 / 「只有 ACK」統一成空字串，避免被當成真的回覆顯示。"""
-        if value is None or isinstance(value, BaseException):
-            return ""
-        text = str(value).strip()
-        if text.startswith("⚠️") or text.startswith("（"):
-            return ""
-        return text
 
     async def _cmd_mccommand(self, message: discord.Message):
         if not self._authorized(message.author):
@@ -3655,7 +3638,7 @@ class DCListener(discord.Client):
             return
 
         status = await message.reply(f"🎮 邀請 {OWNER_ID}...")
-        result = self._clean_result(await self.mc.send_command(f"invite {OWNER_ID}", timeout=12))
+        result = clean_result(await self.mc.send_command(f"invite {OWNER_ID}", timeout=12))
         if result:
             await status.edit(content=f"**邀請結果**\n```\n{_clip(result, 1800)}\n```")
         else:
@@ -3685,7 +3668,7 @@ class DCListener(discord.Client):
         return f"ID {self.config.channel_id}（未找到）" if self.config.channel_id else "未設定"
 
     async def _cmd_setguild(self, message: discord.Message):
-        if not self._require_admin(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 需要管理員權限")
             return
         if message.guild is None:
@@ -3696,7 +3679,7 @@ class DCListener(discord.Client):
         await message.reply(f"✅ 已設定允許的伺服器：{message.guild.name} (`{message.guild.id}`)")
 
     async def _cmd_setchannel(self, message: discord.Message):
-        if not self._require_admin(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 需要管理員權限")
             return
         self.config.channel_id = message.channel.id
@@ -3704,7 +3687,7 @@ class DCListener(discord.Client):
         await message.reply(f"✅ 已設定允許的頻道：{message.channel.mention} (`{message.channel.id}`)")
 
     async def _cmd_reload(self, message: discord.Message):
-        if not self._require_admin(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 需要管理員權限")
             return
         self.whitelist.load()
@@ -3712,7 +3695,7 @@ class DCListener(discord.Client):
         await message.reply("🔄 白名單與封禁名單已重新載入")
 
     async def _cmd_wl(self, message: discord.Message):
-        if not self._require_admin(message):
+        if not self._can_manage(message.author):
             await message.reply("❌ 需要管理員權限")
             return
 
