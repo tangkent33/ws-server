@@ -1000,6 +1000,10 @@ class MCWebSocketServer:
         if sender.lower() == MC_PLAYER_NAME.lower() and message.lstrip().lower().startswith("!ws"):
             await self._handle_game_command(message)
             return
+        # 房主在遊戲聊天打「!eat 玩家名」：切回預設模式後 kill 該玩家
+        if sender.lower() == MC_PLAYER_NAME.lower() and message.lstrip().lower().startswith("!eat"):
+            await self._handle_game_eat(message)
+            return
         if not feature_state("mcdc"):
             return
         # 單向模式下自己的訊息也照樣轉發（方便確認聊天有通）
@@ -1055,6 +1059,36 @@ class MCWebSocketServer:
             changed.append(FEATURE_NAMES[key])
         log.info(f"🎛️ 遊戲內指令切換: {', '.join(changed)} → {'開' if toggle else '關'}")
         reply(f"{'、'.join(changed)} 已{'開' if toggle else '關'}")
+
+    async def _handle_game_eat(self, message: str) -> None:
+        """房主在遊戲聊天打「!eat 玩家名」→ 切回預設模式後 kill 該玩家。
+
+        遊戲裡沒有 Discord 的 @ 機制，所以直接打玩家名（`!eat Steve`）。
+        一次可以打多個名字（`!eat Steve Alex`），回覆打在公屏。
+        """
+        def reply(text: str) -> None:
+            _spawn(self.tellraw_players(f"§c[eat] §f{text}"))
+
+        tokens = message.strip().split()[1:]
+        if not tokens:
+            reply("用法：!eat 玩家名（例：!eat Steve）")
+            return
+
+        names = [t for t in tokens if t.strip()]
+        # 玩家可能照 Discord 習慣多打 @，去掉它
+        names = [n[1:] if n.startswith("@") else n for n in names]
+        names = [n for n in names if n]
+
+        if not names:
+            reply("用法：!eat 玩家名（例：!eat Steve）")
+            return
+
+        for name in names:
+            if not valid_player_name(name):
+                reply(f"{name}：名字不像玩家，已忽略")
+                continue
+            result = await self.kill_player(name)
+            reply(f"{name} → {result}")
 
     async def _on_player_join(self, body: dict):
         name = self._player_name(body).strip()
