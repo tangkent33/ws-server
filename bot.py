@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.5.0"
+__version__ = "9.5.1"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -108,6 +108,16 @@ OWNER_ID = os.getenv("OWNER_ID", "tangkent3")
 
 # 自己的 XUID：填了就完全跳過 /profile 查詢（換過 Gamertag 時很有用）
 MC_XUID = (os.getenv("MC_XUID") or "").strip()
+
+# miaaoo 官方用來發 Xbox 邀請的帳號。你按「加入房間」後，平台是用這批號加你好友、
+# 再發邀請，所以你會在 Xbox 邀請列表看到它們 —— **它們不是入侵者，任何情況都不踢**。
+# 後端會輪換，所以除了下面這幾個，/lianji me 拿到的 addid 帳號（如 MCLobby26）也會自動豁免。
+PLATFORM_INVITERS = {
+    x.strip().lower()
+    for x in (os.getenv("PLATFORM_INVITERS")
+              or "Happy2026MC,HelloMC25,HelloMC25a,HelloMC25b5988,MCLobby26").split(",")
+    if x.strip()
+}
 
 # ------------------------------------------------------------------ 狀態欄
 # 一條常駐訊息，定時改寫成「2/20 個玩家在線 | ... 伺服器已運行 30 分鐘」這種一行式
@@ -266,6 +276,16 @@ def valid_player_name(name: str) -> bool:
     if "tpmultiplayer" in name.lower():
         return False
     return True
+
+
+def is_platform_inviter(name: str) -> bool:
+    """是不是 miaaoo 官方發邀請的帳號（Happy2026MC / HelloMC25 系列）。
+
+    這批號是你按「加入房間」後、平台派來加你好友並發 Xbox 邀請的，
+    屬於正常流程。所有「踢人 / 封禁」的地方都要先問過這一關，
+    否則會把自己加入房間的邀請方踢掉。
+    """
+    return str(name or "").strip().lower() in PLATFORM_INVITERS
 
 
 # 伺服器 UI 廣播（tellraw 狀態面板之類），不要往 Discord 送
@@ -2109,6 +2129,9 @@ class DCListener(discord.Client):
 
     async def on_mc_tp_join(self, player: str):
         """偵測到 TP 平台拉人：報告 + 直接踢出（TP_KICK 可關）。"""
+        if is_platform_inviter(player):
+            log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號（不是 TP 入侵者），略過")
+            return
         if not valid_player_name(player):
             log.warning(f"🚫 TP 事件的名字不像玩家名，直接忽略: {player[:32]!r}")
             return
@@ -2143,6 +2166,9 @@ class DCListener(discord.Client):
 
     async def on_player_joined(self, player: str):
         """有人加入時檢查封禁名單（每次重讀檔案，手改 json 不用重啟）。"""
+        if is_platform_inviter(player):
+            log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不做封禁處理")
+            return
         self.blacklist.load()
         rec = self.blacklist.get(player)
         if not rec:
@@ -2191,6 +2217,9 @@ class DCListener(discord.Client):
         if not ENABLE_COMMAND:
             log.warning("ENABLE_COMMAND=false，略過 kick")
             return "（指令傳送已停用）"
+        if is_platform_inviter(player):
+            log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不執行踢出")
+            return "（miaaoo 邀請帳號，已跳過）"
         if not valid_player_name(player):
             log.warning(f"🚫 拒絕踢出不合法的名字: {player[:32]!r}")
             return "（名字不像玩家，已忽略）"
@@ -2571,6 +2600,10 @@ class DCListener(discord.Client):
         embed.add_field(name="XUID", value=f"`{self.miaaoo.xuid or '未獲取'}`", inline=True)
         embed.add_field(name="AddID", value=f"`{self.miaaoo.addid or '未獲取'}`", inline=True)
         embed.add_field(name="API", value=f"`{self.miaaoo.base_url}`", inline=False)
+        embed.add_field(
+            name="平台邀請號（豁免，不踢）",
+            value=_clip("、".join(sorted(PLATFORM_INVITERS)) or "（無）", 1000),
+            inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="sync", description="重新同步斜線指令（改版後用）")
@@ -2723,7 +2756,10 @@ class DCListener(discord.Client):
             embed.description = (
                 f"房間：**{target.world}**（房主 {target.host}）\n\n"
                 "**下一步**：打開遊戲 → `世界` 分頁 → 點重新整理，房間卡片就會出現，點它加入。\n"
-                "（後端會先把你的帳號加進該帳號的粉絲，再發邀請，所以直接開世界列表就行）"
+                "（後端會先把你的帳號加進該帳號的粉絲，再發邀請，所以直接開世界列表就行）\n\n"
+                "ℹ️ 之後 Xbox 會收到來自 "
+                f"**{_clip('、'.join(sorted(PLATFORM_INVITERS)) or '平台帳號')}** "
+                "的邀請 — 那是 miaaoo 官方的邀請帳號，屬正常流程，不用理會（這些號已設為豁免，不會被踢）。"
             )
             embed.set_footer(text=f"XUID {xuid}｜addid {ident.get('addid', '')}｜roomfrom {target.roomfrom}")
         else:

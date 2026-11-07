@@ -79,6 +79,21 @@
 - bot 重啟後自動接續同一條訊息（`statusboard.json` 記錄頻道與訊息 id；`STATUS_AUTO_START=false` 可關）
 - 手動把訊息刪掉沒關係，下一輪重新整理會自動重建
 
+## 平台邀請號（不會被踢）
+
+miaaoo 的加入機制是：後端先用「邀請帳號」加你好友，再發 Xbox 邀請。所以你會在
+Xbox / 遊戲邀請列表看到 `Happy2026MC`、`HelloMC25`、`HelloMC25a`、`HelloMC25b5988`
+這些號 —— **它們是官方邀請號，不是入侵者**。
+
+這些號列在 `.env` 的 `PLATFORM_INVITERS`（逗號分隔，預設含上面幾個 + `MCLobby26`），
+任何情況都不會被踢：
+
+- 加入事件不觸發封禁攔截（即使有人手動把它們寫進 `blacklist.json`）
+- 命中 TP 特徵也直接略過（不告警、不踢）
+- 手動 `/kick` 也會被拒，回「（miaaoo 邀請帳號，已跳過）」
+
+後端會輪換邀請號，遇到新的直接補進 `PLATFORM_INVITERS` 即可。`/settings` 可看目前名單。
+
 ## 指令跟著 bot 上下線
 
 Discord 的斜線指令註冊後是**常駐**的，bot 離線也還掛在那裡。要讓它「離線就看不到」，

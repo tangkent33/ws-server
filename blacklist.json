@@ -12,5 +12,12 @@
     "until": null,
     "by": "manual",
     "ts": 1794030416032
+  },
+  "TannerOne3240": {
+    "name": "TannerOne3240",
+    "reason": "TP 平台中繼帳號",
+    "until": null,
+    "by": "manual",
+    "ts": 1794030416032
   }
 }
