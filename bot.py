@@ -29,6 +29,7 @@ banapi / miaaoo / discordbot / legacy_commands / app）已全部合併到這支�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -94,6 +95,9 @@ def _data_path(name: str, default: str) -> str:
 WHITELIST_FILE = _data_path("WHITELIST_FILE", "whitelist.json")
 BLACKLIST_FILE = _data_path("BLACKLIST_FILE", "blacklist.json")
 CONFIG_FILE = os.path.expanduser(os.getenv("BRIDGE_CONFIG_FILE", "~/bridge_config.json"))
+# 記錄「每個伺服器上次成功同步的指令樹簽名」，重啟時簽名沒變就跳過 sync，
+# 避免每次啟動都 Bulk Overwrite（PUT）整份指令，撞 Discord 的覆蓋限流（429）。
+COMMAND_SYNC_FILE = _data_path("COMMAND_SYNC_FILE", "command_sync.json")
 # 這個檔案存在代表「這次是使用者主動停的」，run_bot.bat 看到就不要自動重啟
 STOP_FLAG = BASE_DIR / "bot_stop.flag"
 # 舊變數名 MIAOO_ 少一個 A，兩種拼法都接受，避免 .env 改了名字反而失效
@@ -2189,6 +2193,8 @@ class DCListener(discord.Client):
 
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
         self._sync_at: Dict[int, List[float]] = {}  # guild_id → 最近 sync 時間（限流保護）
+        self._cmd_sync_state: Dict[str, str] = {}  # guild_id(str) → 上次同步成功的指令簽名
+        self._load_cmd_sync_state()
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
         self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
         self._tp_announced: Dict[str, float] = {}  # TP 玩家最近一次公屏播報的時間
@@ -2270,6 +2276,38 @@ class DCListener(discord.Client):
                     _bind(child)
             else:
                 _bind(command)
+
+    # ------------------------------------------------ 指令同步（只在變更時 PUT）
+    def _command_signature(self) -> str:
+        """算出目前指令樹的簽名（名字 + 描述 + 參數）。
+
+        指令定義只有在改 bot.py 時才會變；簽名沒變就代表 Discord 上已是最新，
+        重啟時可以跳過 sync，不去消耗 Bulk Overwrite 的限流額度（每 10 分鐘 2 次）。
+        """
+        def _sig(cmd) -> str:
+            if isinstance(cmd, app_commands.Group):
+                subs = ",".join(_sig(c) for c in sorted(cmd.commands, key=lambda c: c.name))
+                return f"G:{cmd.name}:{cmd.description}:({subs})"
+            try:
+                opts = ",".join(f"{p.name}:{getattr(getattr(p, 'type', None), 'value', '')}"
+                                for p in (cmd.parameters or []))
+            except Exception:
+                opts = ""
+            return f"C:{cmd.name}:{cmd.description}:{opts}"
+
+        parts = [_sig(c) for c in sorted(self.tree.get_commands(), key=lambda c: c.name)]
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+    def _load_cmd_sync_state(self):
+        data = _read_json(COMMAND_SYNC_FILE, None)
+        if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
+            self._cmd_sync_state = {str(k): str(v) for k, v in data["guilds"].items()}
+
+    def _save_cmd_sync_state(self):
+        try:
+            _atomic_write_json(COMMAND_SYNC_FILE, {"guilds": self._cmd_sync_state})
+        except OSError as exc:
+            log.error(f"儲存 command_sync.json 失敗: {exc}")
 
     async def _flush_dc_buffer(self):
         """把「還沒登入時收到的遊戲事件」補發到 Discord。"""
@@ -2412,6 +2450,9 @@ class DCListener(discord.Client):
             log.warning(f"移除全域斜線指令失敗: {exc}")
 
         self._synced_guilds.clear()
+        # 指令已從 Discord 移除，本地簽名也要清掉，否則下次啟動會誤判「沒變」而跳過同步
+        self._cmd_sync_state.clear()
+        self._save_cmd_sync_state()
 
     def _sync_allowed(self, guild_id: int) -> bool:
         """Discord 對 guild 指令覆蓋限流：每 10 分鐘只允許 2 次。
@@ -2438,15 +2479,26 @@ class DCListener(discord.Client):
         except Exception as exc:
             log.warning(f"自動重新同步失敗: {exc}")
 
-    async def _sync_guild_commands(self, guilds=None) -> Tuple[int, int]:
+    async def _sync_guild_commands(self, guilds=None, force: bool = False) -> Tuple[int, int]:
         """把本地指令樹同步到伺服器。回傳 (已同步數, 限流跳過數)。
 
         關鍵：同步前先清空該伺服器的指令樹，否則舊版殘留（改了參數的 /status、
         已刪掉的 /join…）會留在 Discord 上，使用者一按就 CommandSignatureMismatch。
+
+        省限流：指令結構沒變（簽名相同）就完全不 PUT，只有簽名變了或 force
+        （手動 `!sync` / 簽名不符自動重同步）才真的去覆寫。
         """
         synced = skipped = 0
+        signature = self._command_signature()
         for guild in (guilds if guilds is not None else self.guilds):
             obj = discord.Object(id=guild.id)
+            gid = str(guild.id)
+
+            # 指令沒變、也同步過了 → 跳過，不 PUT（避免每次重啟都撞限流）
+            if not force and self._cmd_sync_state.get(gid) == signature:
+                self._synced_guilds.add(guild.id)
+                continue
+
             if not self._sync_allowed(guild.id):
                 skipped += 1
                 log.warning(f"⏳ {guild.name} 的指令同步被 Discord 限流，跳過本次")
@@ -2460,6 +2512,8 @@ class DCListener(discord.Client):
                     names = ", ".join(sorted(f"/{c.name}" for c in synced_cmds))
                     self._synced_guilds.add(guild.id)
                     self._mark_synced(guild.id)
+                    self._cmd_sync_state[gid] = signature
+                    self._save_cmd_sync_state()
                     log.info(f"🧹 已同步 {guild.name} 的 {len(synced_cmds)} 個指令: {names}")
                     synced += 1
                     break
@@ -2481,7 +2535,7 @@ class DCListener(discord.Client):
             log.warning(f"⚠️ /{cmd_name} 的簽名與 Discord 不符，自動重新同步")
             self._synced_guilds.clear()
             targets = [interaction.guild] if interaction.guild else None
-            await self._sync_guild_commands(targets)
+            await self._sync_guild_commands(targets, force=True)
             text = ("🔄 **指令定義已更新，已自動重新同步**\n"
                     "請再試一次；如果還是不行，重開 Discord 用戶端（Ctrl+R）讓它刷新指令快取。")
         elif isinstance(error, app_commands.CheckFailure):
@@ -3624,7 +3678,7 @@ class DCListener(discord.Client):
             return
         status = await message.reply("🔄 同步中...")
         self._synced_guilds.clear()
-        synced, skipped = await self._sync_guild_commands()
+        synced, skipped = await self._sync_guild_commands(force=True)
         if skipped and not synced:
             await status.edit(content="⏳ 指令同步被 Discord 限流（每 10 分鐘只能 2 次），已排定稍後自動補同步。原本的指令不會被動到。")
         else:
