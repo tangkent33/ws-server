@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.6"
+__version__ = "9.7.7"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -160,6 +160,40 @@ ENABLE_TP_ALERT = _env_bool("ENABLE_TP_ALERT", "true")
 ENABLE_BAN_ALERT = _env_bool("ENABLE_BAN_ALERT", "true")
 ENABLE_CHAT = _env_bool("ENABLE_CHAT", "true")
 ENABLE_COMMAND = _env_bool("ENABLE_COMMAND", "true")
+
+# ------------------------------------------------------------------ 遊戲內指令可開關的功能
+# 房主在遊戲聊天打「!ws」開頭的指令，就能即時開/關這些功能（不用重啟 bot）。
+# 預設值從上面的 .env 常數來；運行時只改 FEATURE_STATE，不碰 .env。
+_FEATURE_DEFAULTS = {
+    "join":   ENABLE_JOIN_LEAVE,
+    "death":  ENABLE_DEATH,
+    "tp":     ENABLE_TP_ALERT,
+    "tpkick": TP_KICK,
+    "tpann":  TP_ANNOUNCE,
+    "ban":    ENABLE_BAN_ALERT,
+}
+FEATURE_ALIASES = {
+    "join": "join", "joinmsg": "join", "jl": "join",
+    "death": "death", "die": "death",
+    "tp": "tp", "tpalert": "tp",
+    "tpkick": "tpkick", "kick": "tpkick",
+    "tpann": "tpann", "announce": "tpann", "tpannounce": "tpann",
+    "ban": "ban", "banalert": "ban",
+}
+FEATURE_NAMES = {
+    "join": "加入/離開提示",
+    "death": "死亡提示",
+    "tp": "TP 偵測提示",
+    "tpkick": "TP 自動踢出",
+    "tpann": "TP 公屏播報",
+    "ban": "封禁事件提示",
+}
+FEATURE_STATE: Dict[str, bool] = dict(_FEATURE_DEFAULTS)
+
+
+def feature_state(key: str) -> bool:
+    """功能目前是開還是關（會被遊戲內 !ws 指令即時改動）。"""
+    return bool(FEATURE_STATE.get(key, _FEATURE_DEFAULTS.get(key, True)))
 
 # 單向模式：只把遊戲事件送到 Discord，不嘗試送聊天回遊戲
 ONE_WAY_MODE = _env_bool("ONE_WAY_MODE", "true")
@@ -882,7 +916,7 @@ class MCWebSocketServer:
             await self._on_player_leave(body)
 
         elif event == "PlayerDied":
-            if not ENABLE_DEATH:
+            if not feature_state("death"):
                 return
             name = self._player_name(body)
             if name and self.on_death:
@@ -890,7 +924,7 @@ class MCWebSocketServer:
 
         elif event == "PlayerBan":
             msg = str(body.get("message") or "")
-            if msg and ENABLE_BAN_ALERT and self.on_ban:
+            if msg and feature_state("ban") and self.on_ban:
                 await self.on_ban(msg)
 
         elif event == "TP_JOIN":
@@ -905,7 +939,7 @@ class MCWebSocketServer:
 
         elif event == "TP_DETECT":
             msg = str(body.get("message") or "")
-            if not msg or not ENABLE_TP_ALERT:
+            if not msg or not feature_state("tp"):
                 return
             if is_tp_banner(msg):
                 log.debug(f"忽略 TP 外掛橫幅: {_clip(msg, 60)}")
@@ -933,6 +967,10 @@ class MCWebSocketServer:
         # 那不是玩家發言，一起擋掉。
         if not sender or not message or is_ui_spam(message) or is_tp_banner(message):
             return
+        # 房主在遊戲聊天打的控制指令（!ws ...）：開/關功能，不轉發到 Discord
+        if sender.lower() == MC_PLAYER_NAME.lower() and message.lstrip().lower().startswith("!ws"):
+            await self._handle_game_command(message)
+            return
         if not ENABLE_CHAT:
             return
         # 單向模式下自己的訊息也照樣轉發（方便確認聊天有通）
@@ -943,6 +981,51 @@ class MCWebSocketServer:
         log.info(f"💬 {sender}: {message}")
         if self.on_chat:
             await self.on_chat(sender, message)
+
+    async def _handle_game_command(self, message: str) -> None:
+        """房主在遊戲聊天打「!ws ...」開/關功能、看目前狀態。
+
+        回覆直接打在遊戲公屏（tellraw），不用開 Discord。
+        只改 FEATURE_STATE（記憶體），不寫 .env → 重啟後回到 .env 的預設值。
+        """
+        def reply(text: str) -> None:
+            _spawn(self.tellraw_players(f"§a[WS] §f{text}"))
+
+        tokens = message.strip().split()
+
+        # !ws ／ !ws status → 列出每個功能現在開還關
+        if len(tokens) == 1 or (len(tokens) == 2 and tokens[1].lower() == "status"):
+            parts = [f"{label}: {'§a開' if feature_state(key) else '§c關'}"
+                     for key, label in FEATURE_NAMES.items()]
+            reply("　".join(parts))
+            return
+
+        toggle = None
+        targets: List[str] = []
+        for tok in tokens[1:]:
+            t = tok.lower()
+            if t in ("on", "開", "開啟", "enable"):
+                toggle = True
+            elif t in ("off", "關", "關閉", "disable"):
+                toggle = False
+            elif t in ("all", "全部"):
+                targets = list(FEATURE_NAMES)
+            elif t in FEATURE_ALIASES:
+                targets.append(FEATURE_ALIASES[t])
+
+        if toggle is None:
+            reply("用法：!ws 功能 on/off（例：!ws tp off）｜ !ws 看目前狀態")
+            return
+        if not targets:
+            reply("看不懂功能名。可用：join / death / tp / tpkick / tpann / ban / all")
+            return
+
+        changed = []
+        for key in dict.fromkeys(targets):
+            FEATURE_STATE[key] = toggle
+            changed.append(FEATURE_NAMES[key])
+        log.info(f"🎛️ 遊戲內指令切換: {', '.join(changed)} → {'開' if toggle else '關'}")
+        reply(f"{'、'.join(changed)} 已{'開' if toggle else '關'}")
 
     async def _on_player_join(self, body: dict):
         name = self._player_name(body).strip()
@@ -961,7 +1044,7 @@ class MCWebSocketServer:
                 await self.on_room_change(True)
         self.players.add(name)
         log.info(f"➕ {name} 加入")
-        if ENABLE_JOIN_LEAVE and self.on_join:
+        if feature_state("join") and self.on_join:
             await self.on_join(name)
 
     async def _on_player_leave(self, body: dict):
@@ -978,7 +1061,7 @@ class MCWebSocketServer:
                 await self.on_room_change(False)
         self.players.discard(name)
         log.info(f"➖ {name} 離開")
-        if ENABLE_JOIN_LEAVE and self.on_leave:
+        if feature_state("join") and self.on_leave:
             await self.on_leave(name)
 
     # ------------------------------------------------ 送指令
@@ -2468,12 +2551,12 @@ class DCListener(discord.Client):
 
     async def on_mc_join(self, player: str):
         self._seen_players.add(player)          # 「已加入伺服器」是累計，離開也不減
-        if ENABLE_JOIN_LEAVE:
+        if feature_state("join"):
             await self._send_to_discord("伺服器", f"✅ **{player}** 加入了遊戲")
         await self.on_player_joined(player)
 
     async def on_mc_leave(self, player: str):
-        if ENABLE_JOIN_LEAVE:
+        if feature_state("join"):
             await self._send_to_discord("伺服器", f"❌ **{player}** 離開了遊戲")
 
     # ------------------------------------------------ list 對帳
@@ -2535,7 +2618,7 @@ class DCListener(discord.Client):
                 continue                      # 剛報過 / 換房靜默期，只補名單不發訊息
             self._announced_at[name.lower()] = now
             log.info(f"➕ {name} 加入（list 校正）")
-            if ENABLE_JOIN_LEAVE:
+            if feature_state("join"):
                 await self.on_mc_join(name)
 
         # 補報離開：連續 2 次不在名單才算（list 偶爾會抖一下）
@@ -2550,7 +2633,7 @@ class DCListener(discord.Client):
             self._list_miss.pop(name, None)
             self.mc.players.discard(name)
             log.info(f"➖ {name} 離開（list 校正）")
-            if ENABLE_JOIN_LEAVE:
+            if feature_state("join"):
                 await self.on_mc_leave(name)
 
         if len(self._announced_at) > 300:
@@ -2593,7 +2676,7 @@ class DCListener(discord.Client):
         await self._send_to_discord("伺服器", f"💀 {text}")
 
     async def on_mc_ban(self, text: str):
-        if ENABLE_BAN_ALERT:
+        if feature_state("ban"):
             await self._send_to_discord("防禦系統", f"🔨 **封禁事件**\n`{_clip(text, 500)}`")
 
     async def on_mc_tp(self, text: str):
@@ -2660,7 +2743,7 @@ class DCListener(discord.Client):
         now = time.monotonic()
 
         # 公屏播報：同一人 8 秒內只播一次（舊 DLL 可能重複送事件）
-        if TP_ANNOUNCE:
+        if feature_state("tpann"):
             if now - self._tp_announced.get(player.lower(), 0.0) >= 8:
                 self._tp_announced[player.lower()] = now
                 _spawn(self._announce_tp(player))
@@ -2673,21 +2756,21 @@ class DCListener(discord.Client):
         log.warning(f"🚨 TP 平台加入者: {player}")
         rec = self.blacklist.get(player)
 
-        if TP_KICK and TP_AUTO_BLACKLIST and not rec:
+        if feature_state("tpkick") and TP_AUTO_BLACKLIST and not rec:
             rec = self.blacklist.ban(player, "TP 平台加入", TP_BAN_MINUTES, "auto")
             log.info(f"📝 已自動寫入封禁名單: {player}")
 
         status = f"已在封禁名單（{rec.get('reason')}）" if rec else "不在封禁名單"
         lines = [f"🛑 **偵測到 TP 平台拉人**", f"玩家: **{player}**", status]
 
-        if TP_KICK:
+        if feature_state("tpkick"):
             reason = TP_KICK_REASON or (rec or {}).get("reason") or "TP 平台加入"
             result = await self.kick_player(player, reason)
             self._tp_kicked[player.lower()] = now
             lines.append(f"👢 已送出踢出指令（{reason}）")
             lines.append(f"結果: `{result}`")
         else:
-            lines.append("（TP_KICK=false，只提示不踢）")
+            lines.append("（TP 自動踢出已關閉，只提示不踢）")
             lines.append(f"要處理請用 `!ban {player}`")
 
         await self._send_to_discord("防禦系統", "\n".join(lines))

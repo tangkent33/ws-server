@@ -400,3 +400,23 @@ build_gui.bat
 - 端口可用 `.env` 的 `GUI_PORT` 改（預設 8080）
 - exe 只在「bot 正在跑」時才有資料；沒跑 start.bat 會顯示「連不上 bot」提示
 - `dist\`、`*.spec` 是打包產物，不進 git
+
+## 遊戲內指令（開/關功能）
+
+房主在**遊戲聊天**直接打指令，就能即時開關功能（不用重啟 bot，也不用開 Discord）。
+回覆會打在遊戲公屏上：
+
+```text
+!ws                查看每個功能現在是開還是關
+!ws tp off         關掉 TP 偵測提示
+!ws tpkick off     關掉 TP 自動踢出
+!ws join off       關掉加入/離開提示
+!ws death off      關掉死亡提示
+!ws tpann off      關掉 TP 公屏播報
+!ws ban off        關掉封禁事件提示
+!ws all off        一次全關
+!ws all on         一次全開
+```
+
+可用的功能名（都有簡寫）：`join`、`death`、`tp`、`tpkick`、`tpann`、`ban`、`all`。
+`on/off` 也可以打「開/關」。這些只改執行中的記憶體，**重啟後回到 `.env` 的預設值**。
