@@ -24,3 +24,6 @@ __pycache__/
 
 # 主動停止標記（執行期產生）
 bot_stop.flag
+
+# 狀態列執行期狀態（頻道 / 訊息 id）
+statusboard.json

@@ -5,5 +5,12 @@
     "until": null,
     "by": "manual",
     "ts": 1794030416032
+  },
+  "TiptoeGnat3531": {
+    "name": "TiptoeGnat3531",
+    "reason": "TP 平台中繼帳號",
+    "until": null,
+    "by": "manual",
+    "ts": 1794030416032
   }
 }

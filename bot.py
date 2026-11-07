@@ -42,6 +42,7 @@ import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -55,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.4.3"
+__version__ = "9.5.0"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -107,6 +108,14 @@ OWNER_ID = os.getenv("OWNER_ID", "tangkent3")
 
 # 自己的 XUID：填了就完全跳過 /profile 查詢（換過 Gamertag 時很有用）
 MC_XUID = (os.getenv("MC_XUID") or "").strip()
+
+# ------------------------------------------------------------------ 狀態欄
+# 一條常駐訊息，定時改寫成「2/20 個玩家在線 | ... 伺服器已運行 30 分鐘」這種一行式
+STATUS_FILE = _data_path("STATUS_FILE", "statusboard.json")
+STATUS_INTERVAL = max(20, _env_int("STATUS_INTERVAL", 60))   # 刷新間隔（秒）
+MC_MAX_PLAYERS = max(1, _env_int("MC_MAX_PLAYERS", 20))      # 讀不到 list 回顯時的上限
+STATUS_AUTO_START = _env_bool("STATUS_AUTO_START", "true")  # 啟動時自動接續上次的狀態欄
+BOT_STARTED_AT = time.time()                                # 讀不到遊戲進程時的備援基準
 
 # ------------------------------------------------------------------ 封禁
 TP_BAN_MINUTES = _env_int("TP_BAN_MINUTES", 0)              # 0 = 永久
@@ -309,6 +318,101 @@ def extract_players(raw: str) -> List[str]:
     if not tail or tail in ("0", "無"):
         return []
     return [x.strip() for x in tail.split(",") if x.strip()]
+
+
+# ------------------------------------------------------------------ 狀態列用的格式化
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def cn_stamp(moment: Optional[datetime] = None) -> str:
+    """周六, 07. 11月 2026 14:05:12 CST（照 `%a` 會被系統語系影響，所以自己排）。"""
+    t = moment or datetime.now()
+    return (f"{_WEEKDAYS[t.weekday()]}, {t.day:02d}. {t.month}月 {t.year} "
+            f"{t.strftime('%H:%M:%S')} CST")
+
+
+def humanize_duration(seconds: float) -> str:
+    """90 → 1 分鐘；5400 → 1 小時 30 分鐘；200000 → 2 天 7 小時。"""
+    total = max(0, int(seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days} 天 {hours} 小時"
+    if hours:
+        return f"{hours} 小時 {minutes} 分鐘"
+    if minutes:
+        return f"{minutes} 分鐘"
+    return f"{secs} 秒"
+
+
+def parse_list_counts(raw: str) -> Tuple[int, int]:
+    """從 `list` 回顯抓 (在線, 上限)，例如 `There are 2/20 players online:`。"""
+    match = re.search(r"(\d+)\s*/\s*(\d+)", raw or "")
+    if not match:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
+
+
+def game_process_started_at() -> Optional[float]:
+    """本機 Minecraft.Windows.exe 的啟動時間（世界運行時長的近似值）。
+
+    讀不到就回 None：遊戲不在這台機器、或已經關掉。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot in (0, -1):
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not k32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return None
+        while True:
+            if entry.szExeFile.lower() == "minecraft.windows.exe":
+                handle = k32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, entry.th32ProcessID)
+                if not handle:
+                    return None
+                try:
+                    created = FILETIME()
+                    exited = FILETIME()
+                    kernel = FILETIME()
+                    user = FILETIME()
+                    if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                               ctypes.byref(kernel), ctypes.byref(user)):
+                        return None
+                    ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                    return ticks / 1e7 - 11644473600        # FILETIME → Unix 時間
+                finally:
+                    k32.CloseHandle(handle)
+            if not k32.Process32NextW(snapshot, ctypes.byref(entry)):
+                return None
+    finally:
+        k32.CloseHandle(snapshot)
 
 
 # ============================================================ 3. JSON 檔案存放
@@ -1401,6 +1505,195 @@ class RoomPaginator(discord.ui.View):
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
 
 
+class StatusBoard:
+    """一條會自己刷新的伺服器狀態列（一行式）。
+
+        2/20 個玩家在線 ｜ 3 個玩家已加入伺服器 ｜ 伺服器已運行 30 分鐘 ｜ 最近更新時間: ...
+
+    在線人數只用「加入 / 離開」事件累積，**不去打 `list` 指令**：
+    那條指令會被橋接器注入遊戲，每分鐘一次既沒必要，又會污染指令佇列。
+    真實上限也只在第一次連上時問一次（seed），之後沿用。
+    """
+
+    def __init__(self, client: "DCListener"):
+        self.client = client
+        self.channel_id = 0
+        self.message_id = 0
+        self.task: Optional[asyncio.Task] = None
+        self._proc_cache: Tuple[float, Optional[float]] = (0.0, None)
+        self._max_players = MC_MAX_PLAYERS
+        self.load()
+
+    # ------------------------------------------------ 持久化
+    def load(self):
+        data = _read_json(STATUS_FILE, None)
+        if not isinstance(data, dict):
+            return
+        try:
+            self.channel_id = int(data.get("channel") or 0)
+            self.message_id = int(data.get("message") or 0)
+            self._max_players = int(data.get("max") or MC_MAX_PLAYERS)
+        except (TypeError, ValueError):
+            pass
+
+    def save(self):
+        try:
+            _atomic_write_json(STATUS_FILE, {
+                "channel": self.channel_id,
+                "message": self.message_id,
+                "max": self._max_players,
+            })
+        except OSError as exc:
+            log.error(f"儲存 statusboard.json 失敗: {exc}")
+
+    # ------------------------------------------------ 資料
+    def _game_started_at(self) -> Optional[float]:
+        """遊戲進程啟動時間，快取 5 分鐘（每分鐘開一次快照太浪費）。"""
+        now = time.time()
+        stamp, cached = self._proc_cache
+        if now - stamp < 300:
+            return cached
+        try:
+            cached = game_process_started_at()
+        except Exception:
+            cached = None
+        self._proc_cache = (now, cached)
+        return cached
+
+    def uptime_seconds(self) -> float:
+        return max(0.0, time.time() - (self._game_started_at() or BOT_STARTED_AT))
+
+    def render(self) -> str:
+        online = len(self.client.mc.players)
+        joined = len(self.client._seen_players)
+        dot = "🟢" if self.client.mc.game_clients() else "🔴"
+        return (f"{dot} **{online}/{self._max_players}** 個玩家在線 ｜ "
+                f"**{joined}** 個玩家已加入伺服器 ｜ "
+                f"伺服器已運行 **{humanize_duration(self.uptime_seconds())}** ｜ "
+                f"最近更新時間: {cn_stamp()}")
+
+    async def seed(self):
+        """連上遊戲後問一次 `list`：補齊「bot 啟動前就在線的人」與真實上限。"""
+        if not self.client.mc.game_clients():
+            return
+        try:
+            raw = self.client._clean_result(
+                await self.client.mc.send_command("list", timeout=6))
+        except Exception as exc:
+            log.debug(f"狀態列 seed 失敗: {exc}")
+            return
+        online, cap = parse_list_counts(raw)
+        if cap:
+            self._max_players = cap
+        for name in extract_players(raw):
+            self.client.mc.players.add(name)
+            self.client._seen_players.add(name)
+        if online:
+            log.info(f"📊 狀態列 seed：遊戲回報 {online}/{self._max_players} 人")
+
+    # ------------------------------------------------ 動作
+    async def refresh(self) -> str:
+        channel = self.client.get_channel(self.channel_id)
+        if channel is None:
+            return "（找不到頻道）"
+
+        text = self.render()
+
+        if self.message_id:
+            try:
+                message = await channel.fetch_message(self.message_id)
+                if message.content != text:
+                    await message.edit(content=text)
+                return text
+            except discord.NotFound:
+                self.message_id = 0           # 訊息被刪了，下面重建
+            except discord.HTTPException as exc:
+                log.warning(f"狀態列更新失敗: {exc}")
+                return text
+
+        message = await channel.send(text)
+        self.message_id = message.id
+        self.save()
+        try:
+            await message.pin(reason="伺服器狀態列")
+        except discord.HTTPException:
+            pass                              # 沒有管理訊息權限就算了
+        return text
+
+    async def start(self, channel) -> str:
+        self.channel_id = channel.id
+        self.message_id = 0                   # 換頻道就重建一條
+        self.save()
+        await self.seed()
+        text = await self.refresh()
+        self._ensure_loop()
+        log.info(f"📊 狀態列已啟動（每 {STATUS_INTERVAL} 秒刷新）")
+        return text
+
+    async def stop(self, delete_message: bool = True):
+        """停止刷新。delete_message=False 時保留記錄，下次啟動可以接續同一條訊息。"""
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.task = None
+
+        if delete_message:
+            if self.message_id:
+                channel = self.client.get_channel(self.channel_id)
+                if channel is not None:
+                    try:
+                        message = await channel.fetch_message(self.message_id)
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
+            self.channel_id = 0
+            self.message_id = 0
+            self.save()
+            log.info("📊 狀態列已停止")
+        else:
+            log.info("📊 狀態列已暫停（記錄保留，下次啟動接續）")
+
+    def _ensure_loop(self):
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._loop())
+
+    async def _loop(self):
+        while True:
+            try:
+                await asyncio.sleep(STATUS_INTERVAL)
+                await self.refresh()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:          # 單次失敗不該讓整條狀態列死掉
+                log.warning(f"狀態列刷新失敗: {exc}")
+                await asyncio.sleep(30)
+
+    async def resume(self):
+        """重啟後接續上一次的狀態列；沒有的話用已設定的頻道自動建一條。"""
+        if not STATUS_AUTO_START:
+            return
+        try:
+            if not self.channel_id:
+                # 還沒有狀態列 → 拿第一個已設定的頻道直接建立，省得每次都要敲指令
+                targets = list(self.client.config.channel_ids)
+                if self.client.config.channel_id:
+                    targets.append(self.client.config.channel_id)
+                channel = self.client.get_channel(targets[0]) if targets else None
+                if channel is None:
+                    log.info("📊 尚未設定狀態列頻道，用 /statusboard start 指定一個")
+                    return
+                await self.start(channel)
+                return
+            await self.refresh()
+            self._ensure_loop()
+            log.info("📊 已接續上次的狀態列")
+        except Exception as exc:
+            log.warning(f"接續狀態列失敗: {exc}")
+
+
 class DCListener(discord.Client):
     """Discord 端：把遊戲事件送到頻道，並提供管理指令。"""
 
@@ -1429,6 +1722,8 @@ class DCListener(discord.Client):
         self._tp_alert_at: Dict[str, float] = {}   # TP 提示節流（同一類別幾分鐘只發一次）
         self._deferred: deque = deque()            # 等遊戲 WebSocket 連上才送的指令
         self._deferred_task: Optional[asyncio.Task] = None
+        self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
+        self.board = StatusBoard(self)             # 一行式狀態列
         self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
         self._closing = False                      # close() 進來過就別再進來
         self._handlers: Dict[str, Callable] = {
@@ -1468,7 +1763,7 @@ class DCListener(discord.Client):
                     self.slash_kick, self.slash_ban, self.slash_unban, self.slash_banned,
                     self.slash_settings, self.slash_sync, self.slash_wl,
                     self.slash_shutdown,
-                    self.slash_join, self.lianji):
+                    self.slash_join, self.lianji, self.statusboard):
             self.tree.add_command(cmd)
 
         self._bind_commands()
@@ -1517,6 +1812,9 @@ class DCListener(discord.Client):
         if pending:
             await self._sync_guild_commands(pending)
 
+        # 重啟後接續上次的狀態列（訊息還在就接著改，被刪了就重建）
+        await self.board.resume()
+
     async def request_shutdown(self) -> None:
         """主動下線：先移除 Discord 上註冊的斜線指令，再斷線。"""
         if self._shutdown_requested:
@@ -1529,6 +1827,12 @@ class DCListener(discord.Client):
         if self._closing:
             return
         self._closing = True
+
+        # 狀態列留在頻道裡（下次啟動會接著改它），只停掉刷新迴圈
+        try:
+            await self.board.stop(delete_message=False)
+        except Exception as exc:
+            log.warning(f"停止狀態列失敗: {exc}")
 
         if self._deferred_task and not self._deferred_task.done():
             self._deferred_task.cancel()
@@ -1762,6 +2066,7 @@ class DCListener(discord.Client):
         await self._send_to_discord(sender, _pretty(CHAT_FORMAT_MC_TO_DC, sender=sender, message=message))
 
     async def on_mc_join(self, player: str):
+        self._seen_players.add(player)          # 「已加入伺服器」是累計，離開也不減
         if ENABLE_JOIN_LEAVE:
             await self._send_to_discord("伺服器", f"✅ **{player}** 加入了遊戲")
         await self.on_player_joined(player)
@@ -2211,6 +2516,43 @@ class DCListener(discord.Client):
         if len(items) > 20:
             embed.set_footer(text=f"只顯示前 20 筆，共 {len(items)} 筆")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ------------------------------------------------ 斜線指令：狀態列
+    statusboard = app_commands.Group(name="statusboard", description="伺服器狀態列（一行式，自動刷新）")
+
+    @statusboard.command(name="start", description="在目前頻道建立狀態列並開始自動刷新")
+    async def board_start(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return await self._deny(interaction, "❌ 只能在文字頻道 / 討論串裡使用")
+
+        await interaction.response.defer(thinking=True)
+        text = await self.board.start(channel)
+        await interaction.followup.send(
+            f"📊 **狀態列已啟動**（每 {STATUS_INTERVAL} 秒刷新）\n```\n{text}\n```")
+
+    @statusboard.command(name="stop", description="停止自動刷新並刪掉那條狀態訊息")
+    async def board_stop(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+        if not self.board.channel_id:
+            return await self._deny(interaction, "❌ 狀態列還沒啟動")
+        await interaction.response.defer(ephemeral=True)
+        await self.board.stop()
+        await interaction.followup.send("📊 已停止狀態列並刪除訊息", ephemeral=True)
+
+    @statusboard.command(name="now", description="立刻刷新一次並顯示結果")
+    async def board_now(self, interaction: discord.Interaction):
+        if not self._may_manage(interaction):
+            return await self._deny(interaction)
+        if not self.board.channel_id:
+            return await self._deny(interaction, "❌ 狀態列還沒啟動，先用 `/statusboard start`")
+        await interaction.response.defer(ephemeral=True)
+        text = await self.board.refresh()
+        await interaction.followup.send(f"```\n{text}\n```", ephemeral=True)
 
     # ------------------------------------------------ 斜線指令：設定
     @app_commands.command(name="settings", description="查看目前設定")
