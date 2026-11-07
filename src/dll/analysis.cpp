@@ -594,6 +594,7 @@ void HandleChatWindow(const char* win, size_t len, bool atStringStart) {
 
     std::string s = Sanitize(win, sn);
     if (s.size() < 5 || s.size() > 300) return;
+    DumpChatRaw(s);
     if (s[0] != '<') return;
     size_t gt = s.find('>');
     if (gt == std::string::npos || gt < 4 || gt > 17) return;
@@ -615,6 +616,7 @@ static void HandleSayWindow(const char* win, size_t len, const char* sep) {
     if (!ValidUtf8(win, sn)) return;
 
     std::string s = Sanitize(win, sn);
+    DumpChatRaw(s);
     size_t p = s.find(sep);
     if (p == std::string::npos) return;
 
@@ -648,6 +650,25 @@ static bool TextyLook(const std::string& t) {
         }
     }
     return cjk >= 2 || maxRun >= 5;
+}
+
+void DumpChatRaw(const std::string& t) {
+    // 校正用：把「掃描到的每一條字串」原樣寫到 chat_raw.txt（不去重、不篩選），
+    // 讓我們能看出當前版本聊天到底長什麼樣。只在校正期使用。
+    static std::unordered_set<std::string> seen;
+    if (seen.size() > 30000) return;
+    if (!seen.insert(t).second) return;
+
+    static HANDLE hf = INVALID_HANDLE_VALUE;
+    if (hf == INVALID_HANDLE_VALUE) {
+        wchar_t p[MAX_PATH]; DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", p, MAX_PATH);
+        std::wstring path = std::wstring(p, n) + L"\\Packages\\Microsoft.MinecraftUWP_8wekyb3d8bbwe\\LocalState\\chat_raw.txt";
+        hf = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+    }
+    std::string line = t.substr(0, 160) + "\r\n";
+    DWORD w = 0;
+    WriteFile(hf, line.data(), (DWORD)line.size(), &w, nullptr);
 }
 
 void DebugChat(const std::string& t) {

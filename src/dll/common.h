@@ -23,7 +23,7 @@
 // 遊戲開久了記憶體裡會同時存在好幾份舊版 DLL（每次注入的檔名都不同 → 不會被覆蓋），
 // 舊版會繼續送舊格式事件（例如把 TP 橫幅印成「TP Multiplayer (tpmultiplayer1mj)」）。
 // 有這個戳記，橋接器就能直接告訴你「現在講話的是舊版，請重開遊戲」。
-#define BUILD_ID "10.1"
+#define BUILD_ID "10.2"
 
 // ---------------------------------------------------------------- 共用型別
 struct Found {
@@ -59,6 +59,7 @@ bool TextLike(const std::string& s);
 bool ChatNameOk(const std::string& n);
 bool Duplicate(const std::string& key);
 void DebugChat(const std::string& t);
+void DumpChatRaw(const std::string& t);
 void HandleChatWindow(const char* win, size_t len, bool atStringStart);
 
 extern volatile LONG g_connectFail;

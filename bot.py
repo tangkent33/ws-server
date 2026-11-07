@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.8"
+__version__ = "9.7.9"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -438,11 +438,21 @@ def humanize_duration(seconds: float) -> str:
     return f"{secs} 秒"
 
 def parse_list_counts(raw: str) -> Tuple[int, int]:
-    """從 `list` 回顯抓 (在線, 上限)，例如 `There are 2/20 players online:`。"""
-    match = re.search(r"(\d+)\s*/\s*(\d+)", raw or "")
-    if not match:
-        return 0, 0
-    return int(match.group(1)), int(match.group(2))
+    """從 `list` 回顯抓 (在線, 上限)。
+
+    基岩版常見：`There are 2/8 players online:` 或
+    `There are 2 of a max of 8 players online:`；中文可能是「在線 2/8」「共 5 名，最多 12 名」。
+    """
+    raw = raw or ""
+    m = re.search(r"(\d+)\s*/\s*(\d+)", raw)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m2 = re.search(r"(\d+)\s+of\s+a\s+max\s+of\s+(\d+)", raw, re.IGNORECASE)
+    if m2:
+        return int(m2.group(1)), int(m2.group(2))
+    on = re.search(r"(\d+)\s*(?:名玩家|個玩家|名玩家|人在線)", raw)
+    cap = re.search(r"(?:最多|上限|max)\s*[:：]?\s*(\d+)", raw, re.IGNORECASE)
+    return (int(on.group(1)) if on else 0), (int(cap.group(1)) if cap else 0)
 
 def game_process_started_at() -> Optional[float]:
     """本機 Minecraft.Windows.exe 的啟動時間（世界運行時長的近似值）。
@@ -2595,6 +2605,11 @@ class DCListener(discord.Client):
                     if self._in_world is not True:
                         self._in_world = True
                         log.info("🏠 偵測到有效的 list 回覆 → 已進入世界")
+                    # 順手把「上限」更新成遊戲回報的值（list 回覆像 2/8、2 of a max of 8）
+                    _online_n, cap = parse_list_counts(text)
+                    if cap and cap != self.board._max_players:
+                        self.board._max_players = cap
+                        log.info(f"📊 list 回報上限更新：{cap}")
                 names = [n for n in extract_players(text) if looks_like_player_name(n)]
                 if not names:
                     # 沒回顯（非房主 / 指令被擋 / 世界剛載入）→ 10 分鐘提醒一次

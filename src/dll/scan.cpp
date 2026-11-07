@@ -43,6 +43,7 @@ static void ScanChatSegments(const unsigned char* buf, size_t len) {
 
         std::string t = Sanitize((const char*)buf + s, n);
         if (t.size() < 4 || t.size() > 200) continue;
+        DumpChatRaw(t);
 
         // 只接受「整條字串就是 <名字> 訊息」的情況（色碼已被 Sanitize 去掉），
         // 不接受 "xxx> yyy" 這種，否則會把 UI/資源字串全抓進來。
