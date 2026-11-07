@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.10"
+__version__ = "9.7.11"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -2276,6 +2276,14 @@ class DCListener(discord.Client):
 
     async def on_ready(self):
         log.info(f"✅ Discord 已登入：{self.user}")
+        # 「正在玩」狀態：顯示目前版本（Discord 資料卡上會看到「正在玩 目前版本：X.X.X」）
+        try:
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=discord.Game(name=f"目前版本：{__version__}"),
+            )
+        except Exception as exc:
+            log.warning(f"設定在線狀態失敗: {exc}")
         if not self._session:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10),
