@@ -90,6 +90,11 @@ TP_BAN_MINUTES = _env_int("TP_BAN_MINUTES", 0)              # 0 = 永久
 TP_AUTO_BLACKLIST = _env_bool("TP_AUTO_BLACKLIST")
 ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
 
+# 偵測到 TP 平台拉人時：直接踢出（預設開）
+TP_KICK = _env_bool("TP_KICK", "true")
+TP_KICK_REASON = os.getenv("TP_KICK_REASON", "偵測到 TP 平台加入")
+TP_KICK_COOLDOWN = _env_int("TP_KICK_COOLDOWN", 20)         # 同一人幾秒內不重複踢
+
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")
 
@@ -445,6 +450,7 @@ class MCWebSocketServer:
         self.on_tp: Optional[Callable] = None
         self.on_tp_join: Optional[Callable] = None
         self.on_ban: Optional[Callable] = None
+        self.on_kick_result: Optional[Callable] = None
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
 
@@ -629,6 +635,12 @@ class MCWebSocketServer:
             msg = str(body.get("message") or "")
             if msg and ENABLE_TP_ALERT and self.on_tp:
                 await self.on_tp(msg)
+
+        # 鍵盤注入的執行結果（DLL 回報：ok|injected 或 fail|game not focused）
+        elif event == "KickResult":
+            text = str(body.get("message") or "")
+            if text and self.on_kick_result:
+                await self.on_kick_result(text)
 
     @staticmethod
     def _player_name(body: dict) -> str:
@@ -976,6 +988,7 @@ class DCListener(discord.Client):
 
         self._synced_guilds: Set[int] = set()      # 已經同步過斜線指令的伺服器
         self._empty_warned: Dict[int, float] = {}  # 空白訊息告警節流
+        self._tp_kicked: Dict[str, float] = {}     # TP 玩家最近一次被踢的時間
         self._handlers: Dict[str, Callable] = {
             "!sync": self._cmd_sync,
             "!status": self._cmd_status,
@@ -1183,15 +1196,34 @@ class DCListener(discord.Client):
         await self._send_to_discord("防禦系統", "\n".join(lines))
 
     async def on_mc_tp_join(self, player: str):
-        """偵測到 TP 平台拉人：只提示，等你用 /ban 或 !ban 處理。"""
+        """偵測到 TP 平台拉人：報告 + 直接踢出（TP_KICK 可關）。"""
+        now = time.monotonic()
+        last = self._tp_kicked.get(player.lower(), 0)
+        if now - last < TP_KICK_COOLDOWN:
+            log.debug(f"TP 玩家 {player} 在冷卻期內，略過重複處理")
+            return
+
         log.warning(f"🚨 TP 平台加入者: {player}")
         rec = self.blacklist.get(player)
+
+        if TP_KICK and TP_AUTO_BLACKLIST and not rec:
+            rec = self.blacklist.ban(player, "TP 平台加入", TP_BAN_MINUTES, "auto")
+            log.info(f"📝 已自動寫入封禁名單: {player}")
+
         status = f"已在封禁名單（{rec.get('reason')}）" if rec else "不在封禁名單"
-        await self._send_to_discord(
-            "防禦系統",
-            f"🛑 **偵測到 TP 平台拉人**\n玩家: **{player}**\n{status}\n"
-            f"要處理請用 `POST /ban` 或 Discord `!ban {player}`",
-        )
+        lines = [f"🛑 **偵測到 TP 平台拉人**", f"玩家: **{player}**", status]
+
+        if TP_KICK:
+            reason = TP_KICK_REASON or (rec or {}).get("reason") or "TP 平台加入"
+            result = await self.kick_player(player, reason)
+            self._tp_kicked[player.lower()] = now
+            lines.append(f"👢 已送出踢出指令（{reason}）")
+            lines.append(f"結果: `{result}`")
+        else:
+            lines.append("（TP_KICK=false，只提示不踢）")
+            lines.append(f"要處理請用 `!ban {player}`")
+
+        await self._send_to_discord("防禦系統", "\n".join(lines))
 
     async def on_player_joined(self, player: str):
         """有人加入時檢查封禁名單（每次重讀檔案，手改 json 不用重啟）。"""
@@ -1228,6 +1260,19 @@ class DCListener(discord.Client):
             result = "已改用鍵盤注入（遊戲 WebSocket 未連線）"
         log.info(f"👢 kick {player} → {result}")
         return result or "（無回應）"
+
+    async def on_kick_result(self, text: str) -> None:
+        """DLL 回報的執行結果：ok|injected 或 fail|game not focused。"""
+        status, _, detail = text.partition("|")
+        if status == "ok":
+            log.info(f"✅ 踢出指令已在遊戲內執行（{detail}）")
+            return
+        log.warning(f"⚠️ 自動踢出失敗：{detail}")
+        await self._send_to_discord(
+            "防禦系統",
+            f"⚠️ **自動踢出沒有成功**\n原因: `{detail}`\n"
+            f"鍵盤注入需要遊戲視窗在前景，請切回遊戲或手動踢人。",
+        )
 
     # ------------------------------------------------ 斜線指令
     @app_commands.command(name="status", description="顯示橋接狀態")
@@ -1607,6 +1652,7 @@ def _wire(mc: MCWebSocketServer, bot: DCListener):
     mc.on_tp = bot.on_mc_tp
     mc.on_tp_join = bot.on_mc_tp_join
     mc.on_ban = bot.on_mc_ban
+    mc.on_kick_result = bot.on_kick_result
     mc.on_connected = bot.on_bridge_connected
     mc.on_disconnected = bot.on_bridge_disconnected
 

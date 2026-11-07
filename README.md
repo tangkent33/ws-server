@@ -27,6 +27,8 @@
 | `PlayerDied` | `X 被 Y 殺死了` / `X 被 Y 砸爛了` / `X kill by Y` / `X death!` | 💀 … |
 | `PlayerBan` | `玩家xuid … 已被封禁` | 🔨 封禁事件 |
 | `TP_DETECT` | `tpmultiplayer.xyz` 等 | 🛑 TP 平台特徵 |
+| `TP_JOIN` | `玩家嘗試加入 => 名稱:xxx PFID:…` / `try connect: xxx` | 🛑 偵測到 TP 拉人 → **自動踢出** |
+| `KickResult` | DLL 鍵盤注入的執行結果 | 失敗才寫 Discord |
 | `BridgeStatus` | DLL 心跳 | 只寫 console（debug 等級） |
 
 ## 已知限制
@@ -46,7 +48,16 @@ ENABLE_JOIN_LEAVE=true
 ENABLE_DEATH=true
 ENABLE_TP_ALERT=true
 ENABLE_BAN_ALERT=true
+
+TP_KICK=true                          # 偵測到 TP 平台拉人就自動踢（要關改 false）
+TP_KICK_REASON=偵測到 TP 平台加入      # 踢出時顯示的理由
+TP_KICK_COOLDOWN=20                   # 同一人幾秒內不重複踢
+TP_AUTO_BLACKLIST=false               # 要不要順便寫進封禁名單（永久攔）
+TP_BAN_MINUTES=0                      # 上者成立時封多久，0 = 永久
 ```
+
+> 自動踢出是靠 DLL 的鍵盤注入（`kick "名字" §c理由`），**需要遊戲視窗在前景**。
+> 若當時切到瀏覽器，踢出會失敗，Discord 會收到「自動踢出沒有成功」的提示。
 
 ## 原始碼
 `src/dll/*.cpp`、`src/exe/*.cpp`、`bot.py`

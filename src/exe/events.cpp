@@ -67,6 +67,10 @@ void HandleEventLine(const std::string& line) {
     } else if (type == "TP") {
         PrintLine(type, a, b);
         SendEvent("TP_DETECT", "{\"message\":\"" + EscapeJson(a) + "\"}");
+    } else if (type == "CMDRESULT") {
+        // DLL 用鍵盤注入送指令後的結果（ok|injected / fail|game not focused）
+        SetColor(C_GRAY); printf("[cmd] %s %s\n", a.c_str(), b.c_str()); SetColor(C_RESET);
+        SendEvent("KickResult", "{\"message\":\"" + EscapeJson(a + "|" + b) + "\"}");
     } else if (type == "SYS") {
         if (a == "ping") return;
         SetColor(C_GRAY); printf("[sys] %s\n", a.c_str()); SetColor(C_RESET);
