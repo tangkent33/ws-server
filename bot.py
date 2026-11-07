@@ -133,6 +133,13 @@ TP_AUTO_BLACKLIST = _env_bool("TP_AUTO_BLACKLIST")
 ENFORCE_BAN_ON_JOIN = _env_bool("ENFORCE_BAN_ON_JOIN", "true")
 # 外部封禁名單（BAN_RECORDS_API_BASE）命中時是否直接踢出（預設開）
 ENFORCE_EXTERNAL_BAN_ON_JOIN = _env_bool("ENFORCE_EXTERNAL_BAN_ON_JOIN", "true")
+# 每秒主動掃描：list 拿到在線玩家後，用緩存的 acz.cc.cd 黑名單比對，命中就踢。
+# 這跟「加入時檢查」互補：DLL 抓不到加入事件（多人世界常發生）時，靠每秒 list 補抓。
+EXTERNAL_BAN_SCAN = _env_bool("EXTERNAL_BAN_SCAN", "true")
+EXTERNAL_BAN_SCAN_SECONDS = max(1, _env_int("EXTERNAL_BAN_SCAN_SECONDS", 1))  # 掃描週期
+EXTERNAL_BAN_SCAN_COOLDOWN = _env_int("EXTERNAL_BAN_SCAN_COOLDOWN", 30)        # 同一人幾秒內不重複踢
+# 踢人用 @a[name="玩家名"] 選擇器（true）還是 kick "玩家名"（false）
+EXTERNAL_BAN_KICK_SELECTOR = _env_bool("EXTERNAL_BAN_KICK_SELECTOR", "true")
 
 # 偵測到 TP 平台拉人時：直接踢出（預設開）
 TP_KICK = _env_bool("TP_KICK", "true")
@@ -1895,15 +1902,18 @@ class BanRecordsCounter:
                 text = await resp.text()
         except asyncio.TimeoutError:
             self._note = "請求逾時"
+            self._at = now              # 失敗也退避，別讓每秒掃描連環撞限流
             return self._count, self._note
         except aiohttp.ClientError as exc:
             self._note = f"連線失敗：{exc}"
+            self._at = now
             return self._count, self._note
 
         try:
             data = json.loads(text)
         except ValueError:
             self._note = f"HTTP {status} 非 JSON"
+            self._at = now
             return self._count, self._note
 
         items: List[Any] = []
@@ -1917,6 +1927,7 @@ class BanRecordsCounter:
         if status != 200:
             msg = data.get("message") if isinstance(data, dict) else ""
             self._note = f"HTTP {status}{('：' + str(msg)) if msg else ''}"
+            self._at = now
             return self._count, self._note
 
         self._items = [r for r in items if isinstance(r, dict)]
@@ -1942,10 +1953,23 @@ class BanRecordsCounter:
         if not self.enabled:
             return None
         now = time.monotonic()
-        if not self._names or now - self._at >= self.CACHE_TTL:
+        if self._at == 0.0 or now - self._at >= self.CACHE_TTL:
             await self.count(force=True)
         name = str(player or "").strip().lower()
         return self._names.get(name)
+
+    async def cached_names(self) -> Dict[str, dict]:
+        """回傳快取的黑名單（小寫 playerName → 紀錄），過期就重抓一次。
+
+        每秒主動掃描會對「整批在線玩家」比對，用這方法一次拿整份名單，
+        而不是對每個玩家各打一次 lookup（那樣第一次進來會 force 重抓很多次）。
+        """
+        if not self.enabled:
+            return {}
+        now = time.monotonic()
+        if self._at == 0.0 or now - self._at >= self.CACHE_TTL:
+            await self.count(force=True)
+        return self._names
 
 
 class StatusBoard:
@@ -2203,6 +2227,8 @@ class DCListener(discord.Client):
         self._announced_at: Dict[str, float] = {}  # 剛被 DLL 報過的人，list 不重複報
         self._suppress_until: float = 0.0          # 換房間後先靜默填名單，不刷「加入了遊戲」
         self._list_task: Optional[asyncio.Task] = None
+        self._ext_ban_kicked: Dict[str, float] = {}  # 外部黑名單每秒掃描：最近一次踢這人的時間
+        self._ext_ban_task: Optional[asyncio.Task] = None
         self.board = StatusBoard(self)             # 一行式狀態列
         self.ban_records = BanRecordsCounter()     # 外部封禁紀錄統計（狀態列顯示人數）
         self.ban_records.on_update = self._announce_ban_count
@@ -2225,6 +2251,7 @@ class DCListener(discord.Client):
             "!reload": self._cmd_reload,
             "!wl": self._cmd_wl,
             "!help": self._cmd_help,
+            "!eat": self._cmd_eat,
         }
 
     # ------------------------------------------------ 生命週期
@@ -2249,6 +2276,10 @@ class DCListener(discord.Client):
         # 會抓不到或抓成碎片，`list` 是遊戲官方給的名單，名字一定是對的
         if self._list_task is None or self._list_task.done():
             self._list_task = asyncio.create_task(self._list_poll_loop())
+
+        # 外部黑名單每秒掃描：list → 比對緩存的 acz.cc.cd 名單 → 命中就踢
+        if EXTERNAL_BAN_SCAN and (self._ext_ban_task is None or self._ext_ban_task.done()):
+            self._ext_ban_task = asyncio.create_task(self._ext_ban_poll_loop())
 
     def _bind_commands(self):
         """把每個指令綁到這個 bot 實例上。
@@ -2386,6 +2417,13 @@ class DCListener(discord.Client):
             except (asyncio.CancelledError, Exception):
                 pass
 
+        if self._ext_ban_task and not self._ext_ban_task.done():
+            self._ext_ban_task.cancel()
+            try:
+                await self._ext_ban_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         try:
             await self.ban_records.close()
         except Exception:
@@ -2511,7 +2549,7 @@ class DCListener(discord.Client):
             self._warn_empty_content(message)
             return
 
-        # `.eat @玩家`：把被 @ 的玩家在遊戲裡 kill 掉（權限在 _cmd_eat 內檢查）
+        # `.eat @玩家` / `!eat @玩家`：把被 @ 的玩家在遊戲裡 kill 掉（權限在 _cmd_eat 內檢查）
         if content.lower().startswith(".eat"):
             await self._cmd_eat(message)
             return
@@ -2707,6 +2745,65 @@ class DCListener(discord.Client):
             except Exception as exc:
                 log.debug(f"list 輪詢失敗: {exc}")
 
+    async def _ext_ban_poll_loop(self):
+        """每 EXTERNAL_BAN_SCAN_SECONDS 秒問一次 `list`，用緩存的 acz.cc.cd 黑名單比對在線玩家。
+
+        DLL 掃記憶體在多人世界常抓不到加入事件，玩家會「漏報加入」，
+        自然也就不會觸發 on_player_joined 的外部黑名單檢查。這個循環用
+        `list`（遊戲官方回覆）當在線名單，命中 acz.cc.cd 黑名單就直接踢，
+        不依賴 DLL 的任何事件。黑名單本身走 cached_names() 的快取，
+        不會每秒都打一次外部 API（acz.cc.cd 限流很兇）。
+        """
+        last_fail_note = 0.0
+        while True:
+            try:
+                await asyncio.sleep(EXTERNAL_BAN_SCAN_SECONDS)
+                if not ENFORCE_EXTERNAL_BAN_ON_JOIN:
+                    continue
+                if not self.mc.game_clients():
+                    continue
+
+                # 快取的黑名單（小寫名 → 紀錄）；沒配 API 或名單為空就略過
+                banned = await self.ban_records.cached_names()
+                if not banned:
+                    continue
+
+                raw = await self.mc.send_command("list", timeout=6)
+                text = self._clean_result(raw or "")
+                if not text or looks_like_no_world(text):
+                    continue
+                names = [n for n in extract_players(text) if looks_like_player_name(n)]
+                if not names:
+                    now = time.monotonic()
+                    if now - last_fail_note > 600:
+                        last_fail_note = now
+                        log.warning("⚠️ 外部黑名單掃描：list 沒有回顯，略過（進別人房間時常見）")
+                    continue
+
+                now = time.monotonic()
+                for name in names:
+                    rec = banned.get(name.lower())
+                    if not rec:
+                        continue
+                    if is_platform_inviter(name):
+                        continue
+                    # 冷卻：同一人幾秒內不重複踢（list 每秒都在跑，別刷指令）
+                    last = self._ext_ban_kicked.get(name.lower(), 0.0)
+                    if now - last < EXTERNAL_BAN_SCAN_COOLDOWN:
+                        continue
+                    self._ext_ban_kicked[name.lower()] = now
+                    reason = str(rec.get("reason") or "").strip() or "外部封禁名單"
+                    result = await self.kick_player(name, reason,
+                                                    use_selector=EXTERNAL_BAN_KICK_SELECTOR)
+                    await self._send_to_discord(
+                        "防禦系統",
+                        f"👢 **外部封禁攔截（list 掃描）**\n玩家: **{name}**\n理由: {reason}\n指令結果: `{result}`",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug(f"外部黑名單掃描失敗: {exc}")
+
     async def _reconcile_players(self, names: List[str]):
         online = set(names)
         now = time.monotonic()
@@ -2754,6 +2851,7 @@ class DCListener(discord.Client):
         self._tp_kicked.clear()
         self._tp_announced.clear()
         self._tp_alert_at.clear()
+        self._ext_ban_kicked.clear()
         self.board.mark_room_switch()
         # 換房後第一輪 list 對帳先「靜默」填名單，不然新房間裡既有的人
         # 會被整批公告成「加入了遊戲」
@@ -2943,21 +3041,33 @@ class DCListener(discord.Client):
         log.warning(f"⏳ 遊戲 WebSocket 未連線，已排隊 #{len(self._deferred)}: {label}")
         return "⏳ 遊戲 WebSocket 未連線，已排入佇列，連上後自動執行"
 
-    async def kick_player(self, player: str, reason: str = "黑名單") -> str:
+    async def kick_player(self, player: str, reason: str = "黑名單", use_selector: bool = False) -> str:
         if not ENABLE_COMMAND:
             log.warning("ENABLE_COMMAND=false，略過 kick")
             return "（指令傳送已停用）"
         if is_platform_inviter(player):
             log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不執行踢出")
             return "（miaaoo 邀請帳號，已跳過）"
-        if not valid_player_name(player):
+        # selector 模式用「寬鬆」名字校驗：基岩版 gamertag 允許空格（如 "Amo 0704"），
+        # 而 @a[name="..."] 能精確匹配含空格的名字；反之 kick "名字" 用嚴格校驗（純英數底線）。
+        name_ok = looks_like_player_name(player) if use_selector else valid_player_name(player)
+        if not name_ok:
             log.warning(f"🚫 拒絕踢出不合法的名字: {player[:32]!r}")
             return "（名字不像玩家，已忽略）"
-        cmd = f'kick "{player}" §c{reason}'
+        if use_selector:
+            # 用目標選擇器踢：kick @a[name="玩家名"]。比 kick "名字" 更精準，
+            # 玩家名含特殊字元時不會被遊戲誤解析。
+            cmd = f'kick @a[name="{player}"] §c{reason}'
+        else:
+            cmd = f'kick "{player}" §c{reason}'
         return await self.send_game_command(cmd, f"踢出 {player}（{reason}）", player=player)
 
     async def kill_player(self, player: str) -> str:
-        """在遊戲裡 kill 一個玩家（`.eat @玩家` 用的）。"""
+        """在遊戲裡 kill 一個玩家（`!eat @玩家` 用的）。
+
+        創造模式下 `/kill` 可能無效，所以先 `gamemode default` 把它切回
+        預設（生存）模式，再 kill。
+        """
         if not ENABLE_COMMAND:
             log.warning("ENABLE_COMMAND=false，略過 kill")
             return "（指令傳送已停用）"
@@ -2967,8 +3077,12 @@ class DCListener(discord.Client):
         if not valid_player_name(player):
             log.warning(f"🚫 拒絕 kill 不合法的名字: {player[:32]!r}")
             return "（名字不像玩家，已忽略）"
+        # 先切回預設模式（無視創造模式），再 kill
+        gm = await self.send_game_command(
+            f'gamemode default "{player}"', f"切回預設模式 {player}", player=player)
         cmd = f'kill "{player}"'
-        return await self.send_game_command(cmd, f"kill {player}", player=player)
+        result = await self.send_game_command(cmd, f"kill {player}", player=player)
+        return result
 
     async def _deferred_worker(self):
         """等遊戲 WebSocket 連上後，依序補送排隊的指令。"""
@@ -3615,6 +3729,7 @@ class DCListener(discord.Client):
             "**文字指令**（舊版，仍可用）\n"
             "`!status`　`!players`　`!check`　`!settings`\n"
             "`!ban 名字 [分鐘] [理由]`　`!unban 名字`　`!banned`\n"
+            "`!eat @玩家`（kill 被 @ 的人）\n"
             "`!cmd <指令>`　`!invite`　`!sync`　`!reload`　`!wl add/del/list`"
         )
 
@@ -3771,7 +3886,7 @@ class DCListener(discord.Client):
             await status.edit(content=f"📋 結果：\n```\n{_clip(result, 1800)}\n```")
 
     async def _cmd_eat(self, message: discord.Message):
-        """`.eat @玩家` → 把被 @ 的玩家在遊戲裡 kill 掉。
+        """`!eat @玩家`（也接受 `.eat @玩家`）→ 把被 @ 的玩家在遊戲裡 kill 掉。
 
         Discord 的 @ 對應到誰，用「暱稱(display_name) == 遊戲名」來認，
         所以要 kill 誰，就先 @ 那個跟遊戲同名的成員。
@@ -3781,7 +3896,7 @@ class DCListener(discord.Client):
             return
         mentions = message.mentions
         if not mentions:
-            await message.reply("用法：`.eat @玩家`（要 @ 一個人；Discord 暱稱需等於遊戲名）")
+            await message.reply("用法：`!eat @玩家`（要 @ 一個人；Discord 暱稱需等於遊戲名）")
             return
         results = []
         for m in mentions:
