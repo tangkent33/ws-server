@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.3"
+__version__ = "9.7.4"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
@@ -191,6 +191,7 @@ DC_BUFFER_TTL = 180.0         # 秒：Discord 還沒登入時暫存的事件最�
 DC_BUFFER_MAX = 40            # 暫存上限，避免剛開機就被洗版
 MAX_MESSAGE = 1900            # Discord 單則訊息上限 2000，留點邊界
 LOCK_PORT = 27999             # 單一實例鎖
+LIST_POLL_SECONDS = max(15, _env_int("LIST_POLL_SECONDS", 30))  # list 對帳週期
 COMMAND_PREFIX = "!"
 
 def setup_logging() -> logging.Logger:
@@ -1907,6 +1908,10 @@ class DCListener(discord.Client):
         self._dc_buffer: deque = deque()           # Discord 還沒就緒時暫存的訊息
         self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
+        self._list_miss: Dict[str, int] = {}       # list 對帳：連續幾次沒看到這個人
+        self._announced_at: Dict[str, float] = {}  # 剛被 DLL 報過的人，list 不重複報
+        self._suppress_until: float = 0.0          # 換房間後先靜默填名單，不刷「加入了遊戲」
+        self._list_task: Optional[asyncio.Task] = None
         self.board = StatusBoard(self)             # 一行式狀態列
         self.ban_records = BanRecordsCounter()     # 外部封禁紀錄統計（狀態列顯示人數）
         self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
@@ -1946,6 +1951,11 @@ class DCListener(discord.Client):
         # 遊戲 WebSocket 沒連線時，指令排隊等它連上再送
         if self._deferred_task is None or self._deferred_task.done():
             self._deferred_task = asyncio.create_task(self._deferred_worker())
+
+        # list 對帳：DLL 掃記憶體的加入事件在不同世界的記憶體布局下
+        # 會抓不到或抓成碎片，`list` 是遊戲官方給的名單，名字一定是對的
+        if self._list_task is None or self._list_task.done():
+            self._list_task = asyncio.create_task(self._list_poll_loop())
 
     def _bind_commands(self):
         """把每個指令綁到這個 bot 實例上。
@@ -2035,6 +2045,13 @@ class DCListener(discord.Client):
             await self.board.stop(delete_message=False)
         except Exception as exc:
             log.warning(f"停止狀態列失敗: {exc}")
+
+        if self._list_task and not self._list_task.done():
+            self._list_task.cancel()
+            try:
+                await self._list_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         try:
             await self.ban_records.close()
@@ -2292,6 +2309,74 @@ class DCListener(discord.Client):
         if ENABLE_JOIN_LEAVE:
             await self._send_to_discord("伺服器", f"❌ **{player}** 離開了遊戲")
 
+    # ------------------------------------------------ list 對帳
+    async def _list_poll_loop(self):
+        """每 LIST_POLL_SECONDS 秒問一次 `list`，用官方名單校正加入/離開。
+
+        DLL 掃記憶體的加入事件，在某些世界（尤其進到別人的房間）的記憶體
+        布局下會抓不到、或抓成 "gZs" / "加入gI Ҹ" 這種碎片；`list` 的回覆
+        是遊戲本體給的，名字一定是對的。DLL 先報的就不再重報，DLL 漏掉的
+        這裡補報，名單裡消失的補報離開。
+        """
+        last_fail_note = 0.0
+        while True:
+            try:
+                await asyncio.sleep(LIST_POLL_SECONDS)
+                if not self.mc.game_clients():
+                    continue
+                raw = await self.mc.send_command("list", timeout=8)
+                text = self._clean_result(raw or "")
+                names = [n for n in extract_players(text) if looks_like_player_name(n)]
+                if not names:
+                    # 沒回顯（非房主 / 指令被擋 / 世界剛載入）→ 10 分鐘提醒一次
+                    now = time.monotonic()
+                    if now - last_fail_note > 600:
+                        last_fail_note = now
+                        log.warning("⚠️ list 輪詢沒有回顯，加入/離開校正暫時停用"
+                                    "（進到別人的房間時常見）")
+                    continue
+                await self._reconcile_players(names)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug(f"list 輪詢失敗: {exc}")
+
+    async def _reconcile_players(self, names: List[str]):
+        online = set(names)
+        now = time.monotonic()
+        suppressed = now < self._suppress_until
+
+        # 補報加入：DLL 沒報到的（或換房後靜默期）在這裡補
+        for name in names:
+            if name in self.mc.players:
+                continue
+            self.mc.players.add(name)
+            self._list_miss.pop(name, None)
+            if suppressed or now - self._announced_at.get(name.lower(), 0) < 90:
+                continue                      # 剛報過 / 換房靜默期，只補名單不發訊息
+            self._announced_at[name.lower()] = now
+            log.info(f"➕ {name} 加入（list 校正）")
+            if ENABLE_JOIN_LEAVE:
+                await self.on_mc_join(name)
+
+        # 補報離開：連續 2 次不在名單才算（list 偶爾會抖一下）
+        for name in list(self.mc.players):
+            if name in online:
+                self._list_miss.pop(name, None)
+                continue
+            miss = self._list_miss.get(name, 0) + 1
+            self._list_miss[name] = miss
+            if miss < 2:
+                continue
+            self._list_miss.pop(name, None)
+            self.mc.players.discard(name)
+            log.info(f"➖ {name} 離開（list 校正）")
+            if ENABLE_JOIN_LEAVE:
+                await self.on_mc_leave(name)
+
+        if len(self._announced_at) > 300:
+            self._announced_at.clear()
+
     async def on_room_change(self, rejoined: bool):
         """自己加入/離開＝換房間：所有「跟著房間走」的統計重置。
 
@@ -2304,6 +2389,10 @@ class DCListener(discord.Client):
         self._tp_announced.clear()
         self._tp_alert_at.clear()
         self.board.mark_room_switch()
+        # 換房後第一輪 list 對帳先「靜默」填名單，不然新房間裡既有的人
+        # 會被整批公告成「加入了遊戲」
+        self._suppress_until = time.monotonic() + 50
+        self._list_miss.clear()
         log.info("🏠 已切換房間：在線 / 已加入 / 運行時間統計重置")
         try:
             await self._send_to_discord(
