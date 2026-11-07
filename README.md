@@ -94,17 +94,19 @@ Xbox / 遊戲邀請列表看到 `Happy2026MC`、`HelloMC25`、`HelloMC25a`、`He
 
 後端會輪換邀請號，遇到新的直接補進 `PLATFORM_INVITERS` 即可。`/settings` 可看目前名單。
 
-## 指令跟著 bot 上下線
+## 斜線指令常駐（不再「離線就消失」）
 
-Discord 的斜線指令註冊後是**常駐**的，bot 離線也還掛在那裡。要讓它「離線就看不到」，
-唯一的方法是退出前主動刪掉 —— 本專案就是這樣做的：
+Discord 對「每個伺服器的指令覆蓋」限流很兇：**每 10 分鐘只允許 2 次 PUT**。
+舊版預設 `CLEAR_COMMANDS_ON_EXIT=true`，每次退出都把指令清掉、重啟再重新註冊，
+頻繁重啟就會撞 429，指令被清空後又註冊不回來 → 用戶看到的就是**「斜線指令消失」**。
+
+因此現在改成**指令常駐**（像一般 bot 一樣），預設 `CLEAR_COMMANDS_ON_EXIT=false`：
 
 | 時機 | 行為 |
 | --- | --- |
-| `start.bat` / `run_bot.bat` 啟動 | 先清空全域指令，再逐個伺服器同步（先 `clear` 再註冊，蓋掉舊版殘留） |
-| `/shutdown`、`stop.bat`、Ctrl+C、SIGTERM | 清空所有伺服器 + 全域指令 → 斷線 → 寫入 `bot_stop.flag` |
-| `run_bot.bat` 看到 `bot_stop.flag` | 刪掉標記並跳出迴圈，**不再自動重啟** |
-| 非主動退出（崩潰 / 被 taskkill /f） | 來不及清，指令會殘留；下次啟動會重新同步覆蓋 |
+| 啟動 | 直接刷新（sync 覆蓋更新），不清空不註銷 |
+| `/shutdown`、`stop.bat`、Ctrl+C | 預設**不刪指令**，只斷線 |
+| 想恢復「離線就刪指令」 | `.env` 設 `CLEAR_COMMANDS_ON_EXIT=true`（注意會吃限流額度） |
 
 `stop.bat` 會先呼叫 `python bot.py --stop`（打 Ban API 的 `POST /shutdown`）走優雅關閉，
 失敗才退回強制結束。也可以手動執行：

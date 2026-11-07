@@ -144,9 +144,14 @@ TP_ANNOUNCE_TEXT = os.getenv("TP_ANNOUNCE_TEXT", "§e[TP] §f玩家嘗試加入�
 KICK_QUEUE_TTL = _env_int("KICK_QUEUE_TTL", 600)            # 排隊多久還沒連上就作廢（秒）
 KICK_QUEUE_MAX = _env_int("KICK_QUEUE_MAX", 50)             # 佇列上限，避免爆量
 
-# 斜線指令跟著 bot 的壽命走：啟動時註冊，關閉前全部刪掉
-# （Discord 的指令本身是常駐的，只能靠「退出前主動刪除」來實現）
-CLEAR_COMMANDS_ON_EXIT = _env_bool("CLEAR_COMMANDS_ON_EXIT", "true")
+# 斜線指令要不要在 bot 關閉前主動刪掉。
+#
+# Discord 對「每個伺服器的指令覆蓋」限流很兇：每 10 分鐘只允許 2 次 PUT。
+# 舊版預設 true（離線就刪指令），結果「退出清空」+「重啟註冊」連續消耗限流額度，
+# 撞 429 後指令被清空又註冊不回來 → 用戶看到的現象就是「斜線指令消失」。
+#
+# 改成預設 false：指令**常駐** Discord，關閉不主動刪，啟動直接刷新覆蓋即可。
+CLEAR_COMMANDS_ON_EXIT = _env_bool("CLEAR_COMMANDS_ON_EXIT", "false")
 
 BAN_API_PORT = _env_int("BAN_API_PORT", 3001)
 BAN_API_KEY = os.getenv("BAN_API_KEY", "my-secret-123")

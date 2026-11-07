@@ -197,17 +197,19 @@ DWORD WINAPI ScanThread(LPVOID) {
         if (GetTickCount() - lastPing > 20000) {
             lastPing = GetTickCount();
             SendLine("SYS|ping");
-            // 以前連不上就立刻 return 0：遇到橋接器重啟（幾秒鐘）也會永久停掃。
-            // 現在改成「連續 2 分鐘都連不上」才退出——這樣橋接器短暫重啟能自動恢復，
-            // 真的關掉時舊 DLL 也不會在遊戲裡一直殘留。
+            // 橋接器（MC-WS.exe）重啟的幾秒到幾分鐘內，這裡會連不上。
+            // 以前「連續 2 分鐘連不上就 return 0」太短：stop.bat 會 taskkill 橋接器，
+            // 用戶若隔一陣子才 start.bat，舊 DLL 的掃描執行緒就永久退出；
+            // 新注入的 DLL 若一時沒抓回聊天格式，聊天就會「看起來永久失效」。
+            // 改成 30 分鐘才退出：短暫重啟能自動恢復，真的關掉時也不會永久殘留。
             if (g_connectFail > 5) {
-                if (++deadTicks >= 6) return 0;
+                if (++deadTicks >= 90) return 0;   // 90 × 20 秒 ≈ 30 分鐘
                 InterlockedExchange(&g_connectFail, 0);
             } else {
                 deadTicks = 0;
             }
         }
-        // 橋接器連不上時放慢，避免殘留的 DLL 在背景全速空掃（它不會再自行退出）
+        // 橋接器連不上時放慢，避免殘留的 DLL 在背景全速空掃
         Sleep(g_connectFail > 5 ? 2000 : (hot.empty() ? 20 : 120));
     }
     return 0;

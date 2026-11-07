@@ -111,6 +111,10 @@ int main() {
 
     SetColor(C_GREEN); printf("[+] 已注入 %ls (pid=%lu)，等待事件...\n\n", g_loadedDll, pid); SetColor(C_RESET);
     SendEvent("BridgeStatus", "{\"message\":\"bridge online\"}");
+    // 一定要在第一時間送 BridgeHello 讓 bot 辨識「這條是橋接器」。
+    // 舊版只有 EnsureConnected() 在「重連」時才送；若是 bot 先開、橋接器後開，
+    // 初次連線不會送 BridgeHello → bot 分不清誰是橋接器，會把 tellraw/訂閱誤發到橋接器。
+    SendEvent("BridgeHello", "{}");
 
     int tick = 0;
     while (true) {
