@@ -1,4 +1,4 @@
-﻿# MC 聊天橋接 v9（單向：遊戲 → Discord）
+﻿# MC 聊天橋接 v10（單向：遊戲 → Discord）
 
 ## 檔案
 | 檔案 | 說明 |
@@ -321,11 +321,34 @@ Minecraft.Windows.exe
 ## 從 GitHub 下載後能直接用嗎？
 
 **要先建置一次**。倉庫裡不放現成的 `MC-WS.exe` / `827dll.dll`
-（注入型 DLL 直接發佈會被防毒軟體誤殺，自己編譯一份更乾淨）：
+（注入型 DLL 直接發佈會被防毒軟體誤殺，自己編譯一份更乾淨）。
 
-1. 安裝 Visual Studio 2022（Community 版免費），勾選「使用 C++ 的桌面開發」工作負載。
-2. 雙擊 `build.bat` —— 它會自動找 MSVC（`cl.exe`），編出 `827dll.dll` 與 `MC-WS.exe`。
-3. 之後 `start.bat` 正常使用；改了 `src/` 底下的程式碼就再跑一次 `build.bat`。
+建置一律走 **Gradle wrapper（gradlew）**，不用另外安裝 Gradle ——
+第一次執行時 wrapper 會自己下載對應版本的 Gradle 發行版：
+
+```bat
+gradlew.bat build
+```
+
+編出來的 `827dll.dll` 與 `MC-WS.exe` 會放在專案根目錄，`start.bat` 直接就能用。
+
+### 事前準備
+
+| 需要 | 說明 |
+|---|---|
+| Visual Studio 2022 Community（免費） | 安裝時勾選「**使用 C++ 的桌面開發**」工作負載（含 MSVC 與 Windows SDK） |
+| JDK 17 或更新版本 | Gradle wrapper 需要 Java，`java -version` 有輸出即可 |
+| Python 3.10+ | bot 端執行用（第一次跑 `start.bat` 會自動裝 `requirements.txt`） |
+
+### 建置流程
+
+1. `gradlew.bat build` —— 它會自己找到 Visual Studio 的 MSVC 與 Windows SDK，
+   直接呼叫 `cl.exe` 編出兩個產物（不用跑 `vcvars64.bat`，也不用先設環境變數）
+2. 缺東西時會明確告訴你缺什麼（沒裝 VS C++ 工具 / 沒裝 Windows SDK）
+3. 之後 `start.bat` 正常啟動；改了 `src/` 底下的程式碼就再跑一次 `gradlew.bat build`
+4. 想清乾淨：`gradlew.bat clean`
+
+> `build.bat` 還留著，但它現在只是 `gradlew.bat build` 的捷徑（習慣雙擊的人用）。
 
 Python 端不用建置：第一次跑 `start.bat` 會自動 `pip install -r requirements.txt`
 （discord.py / aiohttp / websockets / python-dotenv），並幫你把 `.env.example`

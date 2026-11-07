@@ -1,0 +1,315 @@
+// ============================================================
+//  MC 聊天橋接 v10 —— 建置入口（Gradle）
+//
+//  Windows 上執行：
+//      gradlew.bat build        （PowerShell 可用 .\gradlew build）
+//
+//  這個腳本做的事和舊的 build.bat 一樣：找到 Visual Studio 的 MSVC 與
+//  Windows SDK，直接呼叫 cl.exe 編出
+//      827dll.dll   （注入進 Minecraft 的擷取模組）
+//      MC-WS.exe    （管道 → WebSocket 的橋接器）
+//  產物放在專案根目錄，位置和 start.bat 預期的一致。
+//
+//  不需要 Build Tools 的 vcvars64.bat（那玩意兒會叫 reg.exe，在某些
+//  環境下會被擋），這裡自己組 INCLUDE / LIB / PATH，比較穩。
+// ============================================================
+
+import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.TaskAction
+import org.gradle.process.ExecOperations
+
+import javax.inject.Inject
+
+plugins {
+    id 'base'
+}
+
+abstract class BuildNativeTask extends DefaultTask {
+
+    @Inject
+    abstract ExecOperations getExecOps()
+
+    /** 專案根目錄（在註冊任務時填入，避免執行期碰 Task.project）。 */
+    @Internal
+    File projectDirectory
+
+    private static final List<String> DLL_SOURCES = [
+        'src/dll/dllmain.cpp',
+        'src/dll/http.cpp',
+        'src/dll/analysis.cpp',
+        'src/dll/scan.cpp',
+        'src/dll/inject.cpp',
+    ]
+
+    private static final List<String> EXE_SOURCES = [
+        'src/exe/main.cpp',
+        'src/exe/globals.cpp',
+        'src/exe/ws.cpp',
+        'src/exe/httpserver.cpp',
+        'src/exe/events.cpp',
+        'src/exe/winutil.cpp',
+    ]
+
+    // ------------------------------------------------ 小工具
+
+    private static String consoleCharset() {
+        String enc = System.getProperty('native.encoding')
+        return enc ? enc : java.nio.charset.Charset.defaultCharset().name()
+    }
+
+    /** 執行並把 stdout+stderr 一起收回來（不因非零退出碼中斷）。 */
+    private String capture(File exe, List<String> args, Map<String, String> env = null) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream()
+        execOps.exec { spec ->
+            spec.commandLine([exe.absolutePath] + args)
+            spec.standardOutput = out
+            spec.errorOutput = out
+            spec.ignoreExitValue = true
+            if (env != null) {
+                spec.environment(env)
+            }
+        }
+        return out.toString(consoleCharset())
+    }
+
+    /** 版本號目錄排序（14.51.36231 / 10.0.26100.0 這種）。 */
+    private static List<File> sortByVersionDesc(List<File> dirs) {
+        return dirs.sort(false) { File a, File b ->
+            def na = a.name.tokenize('.').collect { it.isInteger() ? it.toInteger() : 0 }
+            def nb = b.name.tokenize('.').collect { it.isInteger() ? it.toInteger() : 0 }
+            for (int i = 0; i < Math.min(na.size(), nb.size()); i++) {
+                int c = na[i] <=> nb[i]
+                if (c != 0) return c
+            }
+            return na.size() <=> nb.size()
+        }
+    }
+
+    // ------------------------------------------------ 找 Visual Studio / SDK
+
+    private File findVsWhere() {
+        return [
+            new File('C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'),
+            new File('C:/Program Files/Microsoft Visual Studio/Installer/vswhere.exe'),
+        ].find { it.isFile() }
+    }
+
+    private File findVsInstall() {
+        File vswhere = findVsWhere()
+        if (vswhere != null) {
+            String out = capture(vswhere, [
+                '-latest', '-products', '*',
+                '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                '-property', 'installationPath',
+            ])
+            String line = out.readLines().find { it.trim() }
+            if (line) {
+                File dir = new File(line.trim())
+                if (new File(dir, 'VC/Tools/MSVC').isDirectory()) {
+                    return dir
+                }
+            }
+        }
+        // vswhere 不在或查不到 → 掃常見路徑
+        List<String> guess = [
+            'C:/Program Files/Microsoft Visual Studio/2022/Community',
+            'C:/Program Files/Microsoft Visual Studio/2022/Professional',
+            'C:/Program Files/Microsoft Visual Studio/2022/Enterprise',
+            'C:/Program Files/Microsoft Visual Studio/2022/BuildTools',
+            'C:/Program Files/Microsoft Visual Studio/18/Community',
+            'C:/Program Files/Microsoft Visual Studio/18/BuildTools',
+            'C:/Program Files (x86)/Microsoft Visual Studio/2019/Community',
+            'C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools',
+        ]
+        return guess.collect { new File(it) }
+                    .find { new File(it, 'VC/Tools/MSVC').isDirectory() }
+    }
+
+    private File findToolset(File vsInstall) {
+        File root = new File(vsInstall, 'VC/Tools/MSVC')
+        File[] dirs = root.listFiles()
+        if (dirs == null) return null
+        return sortByVersionDesc(dirs.toList())
+                .find { new File(it, 'bin/Hostx64/x64/cl.exe').isFile() }
+    }
+
+    private Map findSdk() {
+        List<File> roots = [
+            new File('C:/Program Files (x86)/Windows Kits/10'),
+            new File('C:/Program Files/Windows Kits/10'),
+        ].findAll { new File(it, 'Include').isDirectory() }
+        for (File root : roots) {
+            File[] vers = new File(root, 'Include').listFiles()
+            if (vers == null) continue
+            File hit = sortByVersionDesc(vers.toList()).find { File d ->
+                new File(d, 'um/windows.h').isFile() &&
+                new File(root, "Lib/${d.name}/um/x64").isDirectory()
+            }
+            if (hit != null) {
+                return [root: root, version: hit.name]
+            }
+        }
+        return null
+    }
+
+    private Map<String, String> buildEnv(File toolset, File sdkRoot, String sdkVer) {
+        List<String> inc = [
+            new File(toolset, 'include'),
+            new File(sdkRoot, "Include/${sdkVer}/ucrt"),
+            new File(sdkRoot, "Include/${sdkVer}/um"),
+            new File(sdkRoot, "Include/${sdkVer}/shared"),
+            new File(sdkRoot, "Include/${sdkVer}/winrt"),
+            new File(sdkRoot, "Include/${sdkVer}/cppwinrt"),
+        ].findAll { it.isDirectory() }*.absolutePath
+
+        List<String> lib = [
+            new File(toolset, 'lib/x64'),
+            new File(sdkRoot, "Lib/${sdkVer}/ucrt/x64"),
+            new File(sdkRoot, "Lib/${sdkVer}/um/x64"),
+        ].findAll { it.isDirectory() }*.absolutePath
+
+        List<String> path = ([
+            new File(toolset, 'bin/Hostx64/x64'),
+            new File(sdkRoot, "bin/${sdkVer}/x64"),
+        ].findAll { it.isDirectory() }*.absolutePath)
+        String oldPath = System.getenv('PATH')
+        if (oldPath) path.add(oldPath)
+
+        return [
+            'PATH': path.join(';'),
+            'INCLUDE': inc.join(';'),
+            'LIB': lib.join(';'),
+        ]
+    }
+
+    /**
+     * 產物可能被正在執行的程式鎖住（MC-WS.exe 還在跑、遊戲還插著 827dll.dll）。
+     * Windows 不允許刪除使用中的檔案，但允許「改名」—— 改名後就能編新的，
+     * 舊的留給下次 clean 收掉。
+     */
+    private void clearArtifact(File f) {
+        if (!f.exists()) return
+        if (f.delete()) return
+        File old = new File(f.parentFile, f.name.replace('.', '.old.') )
+        old.delete()
+        if (f.renameTo(old)) {
+            logger.lifecycle("[i] ${f.name} 正在使用中，已改名為 ${old.name}，編譯後不影響執行中的程式")
+        } else {
+            throw new GradleException(
+                "${f.name} 被鎖住了，刪不掉也改不了名。\n" +
+                '請先關掉正在執行的 MC-WS.exe（或關閉 Minecraft），再跑一次 gradlew.bat build。')
+        }
+    }
+
+    private void compile(File cl, File workDir, List<String> sources,
+                         List<String> extraArgs, List<String> linkArgs,
+                         Map<String, String> env, String label) {
+        workDir.mkdirs()
+        List<String> args = ['/nologo', '/MT', '/O2', '/utf-8', '/EHsc'] +
+                            extraArgs + sources.collect { it } +
+                            ['/link', '/INCREMENTAL:NO'] + linkArgs
+
+        logger.lifecycle("[cl] ${label}")
+        ByteArrayOutputStream out = new ByteArrayOutputStream()
+        def result = execOps.exec { spec ->
+            spec.commandLine([cl.absolutePath] + args)
+            spec.workingDir = workDir
+            spec.environment(env)
+            spec.standardOutput = out
+            spec.errorOutput = out
+            spec.ignoreExitValue = true
+        }
+        String log = out.toString(consoleCharset()).trim()
+        if (log) logger.lifecycle(log)
+        if (result.exitValue != 0) {
+            throw new GradleException("編譯 ${label} 失敗（cl.exe 退出碼 ${result.exitValue}）。\n" +
+                "常見原因：Visual Studio 沒勾「使用 C++ 的桌面開發」、或 Windows SDK 缺件。")
+        }
+    }
+
+    @TaskAction
+    void buildNative() {
+        if (!System.getProperty('os.name').toLowerCase().contains('windows')) {
+            throw new GradleException('本專案的 native 部分只支援 Windows 建置（需要 MSVC）。')
+        }
+
+        File dir = projectDirectory
+        logger.lifecycle('── MC 聊天橋接：開始編譯 ──────────────────────')
+
+        File vs = findVsInstall()
+        if (vs == null) {
+            throw new GradleException(
+                '找不到 Visual Studio（含 C++ 工具）。\n' +
+                '請安裝 Visual Studio 2022 Community（免費）並勾選「使用 C++ 的桌面開發」：\n' +
+                '  https://visualstudio.microsoft.com/vs/community/')
+        }
+        File toolset = findToolset(vs)
+        if (toolset == null) {
+            throw new GradleException("在 ${vs} 找不到 MSVC 工具集（VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe）。\n" +
+                '請在 Visual Studio Installer 補裝「MSVC v143 - VS 2022 C++ x64/x86 生成工具」。')
+        }
+        Map sdk = findSdk()
+        if (sdk == null) {
+            throw new GradleException('找不到 Windows 10/11 SDK（需 Include\\<ver>\\um\\windows.h 與 Lib\\<ver>\\um\\x64）。\n' +
+                '請在 Visual Studio Installer 勾選「Windows 11 SDK」。')
+        }
+
+        logger.lifecycle("VS      : ${vs}")
+        logger.lifecycle("MSVC    : ${toolset}")
+        logger.lifecycle("SDK     : ${sdk.root.name} ${sdk.version}")
+
+        Map<String, String> env = buildEnv(toolset, sdk.root as File, sdk.version as String)
+        File cl = new File(toolset, 'bin/Hostx64/x64/cl.exe')
+
+        // 舊產物可能被正在跑的遊戲 / 橋接器鎖住 → 先改名再編
+        File dll = new File(dir, '827dll.dll')
+        File exe = new File(dir, 'MC-WS.exe')
+        clearArtifact(dll)
+        clearArtifact(exe)
+
+        List<String> dllSources = DLL_SOURCES.collect { new File(dir, it).absolutePath }
+        List<String> exeSources = EXE_SOURCES.collect { new File(dir, it).absolutePath }
+
+        compile(cl, new File(dir, 'build/obj/dll'), dllSources,
+                ['/LD', "/Fe:${dll.absolutePath}".toString()],
+                ['winhttp.lib'], env, '827dll.dll')
+
+        compile(cl, new File(dir, 'build/obj/exe'), exeSources,
+                ["/Fe:${exe.absolutePath}".toString()],
+                ['ws2_32.lib', 'advapi32.lib'], env, 'MC-WS.exe')
+
+        if (!dll.isFile() || !exe.isFile()) {
+            throw new GradleException('編譯看似成功，但產物不存在：請檢查 cl.exe 的輸出。')
+        }
+
+        logger.lifecycle('── 編譯完成 ──────────────────────────────────')
+        logger.lifecycle(String.format('  827dll.dll  %,.0f KB', dll.length() / 1024.0d))
+        logger.lifecycle(String.format('  MC-WS.exe   %,.0f KB', exe.length() / 1024.0d))
+        logger.lifecycle('  下一步：雙擊 start.bat 啟動')
+    }
+}
+
+tasks.register('buildNative', BuildNativeTask) {
+    projectDirectory = layout.projectDirectory.asFile
+    group = 'build'
+    description = '用 MSVC 編譯 827dll.dll（注入模組）與 MC-WS.exe（橋接器）'
+}
+
+// gradlew build / gradlew assemble 都會先編 native
+tasks.named('assemble') {
+    dependsOn 'buildNative'
+}
+
+tasks.named('clean', Delete) {
+    delete '827dll.dll', '827dll.old.dll', 'MC-WS.exe', 'MC-WS.old.exe',
+           'src/dll/obj', 'src/exe/obj'
+}
+
+tasks.register('runBot', Exec) {
+    group = 'application'
+    description = '直接啟動 Discord bot（等同 run_bot.bat）'
+    workingDir = layout.projectDirectory.asFile
+    commandLine 'cmd', '/c', 'run_bot.bat'
+}
