@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 r"""Discord ⇄ Minecraft 橋接程式（單檔版）。
 
 原本拆在 bridge/ 套件裡的模組（config / jsonstore / textutil / mcws /
@@ -56,23 +56,20 @@ from dotenv import load_dotenv
 from websockets import serve
 from websockets.legacy.server import WebSocketServerProtocol
 
-__version__ = "9.7.0"
+__version__ = "9.7.1"
 
 # ============================================================ 1. 設定與日誌
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-
 def _env_bool(name: str, default: str = "false") -> bool:
     return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "on")
-
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, default)).strip())
     except (TypeError, ValueError):
         return default
-
 
 # ------------------------------------------------------------------ Discord
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
@@ -93,7 +90,6 @@ def _data_path(name: str, default: str) -> str:
     raw = os.path.expanduser((os.getenv(name) or default).strip())
     path = Path(raw)
     return str(path if path.is_absolute() else BASE_DIR / path)
-
 
 WHITELIST_FILE = _data_path("WHITELIST_FILE", "whitelist.json")
 BLACKLIST_FILE = _data_path("BLACKLIST_FILE", "blacklist.json")
@@ -118,13 +114,6 @@ PLATFORM_INVITERS = {
               or "Happy2026MC,HelloMC25,HelloMC25a,HelloMC25b5988,MCLobby26").split(",")
     if x.strip()
 }
-
-# ------------------------------------------------------------------ acz 玩家紀錄 API
-# https://acz.cc.cd　Bearer Token（POST /auth/login 拿到的永久 Token）
-ACZ_API_BASE = (os.getenv("ACZ_API_BASE") or "https://acz.cc.cd").rstrip("/")
-ACZ_TOKEN = (os.getenv("ACZ_TOKEN") or "").strip()
-ACZ_CHECK_ON_JOIN = _env_bool("ACZ_CHECK_ON_JOIN", "true")   # 加入時查紀錄（只提示）
-ACZ_UPLOAD_ON_BAN = _env_bool("ACZ_UPLOAD_ON_BAN", "false")  # 本地封禁後自動上報
 
 # ------------------------------------------------------------------ 狀態欄
 # 一條常駐訊息，定時改寫成「2/20 個玩家在線 | ... 伺服器已運行 30 分鐘」這種一行式
@@ -181,7 +170,6 @@ COMMAND_BLACKLIST = {
 CHAT_FORMAT_MC_TO_DC = os.getenv("CHAT_FORMAT_MC_TO_DC", "{message}")
 CHAT_FORMAT_DC_TO_MC = os.getenv("CHAT_FORMAT_DC_TO_MC", "§c[§6Discord] §b{username}§e: {message}")
 
-
 def _parse_ids(env_str: str) -> List[int]:
     """把 "123, 456" 轉成 [123, 456]，忽略 0 與非數字。"""
     out: List[int] = []
@@ -190,7 +178,6 @@ def _parse_ids(env_str: str) -> List[int]:
         if chunk.isdigit() and int(chunk) != 0:
             out.append(int(chunk))
     return out
-
 
 INIT_ALLOWED_GUILDS = _parse_ids(os.getenv("ALLOWED_GUILD_ID", "0"))
 INIT_ALLOWED_CHANNELS = _parse_ids(os.getenv("ALLOWED_CHANNEL_ID", "0"))
@@ -205,7 +192,6 @@ DC_BUFFER_MAX = 40            # 暫存上限，避免剛開機就被洗版
 MAX_MESSAGE = 1900            # Discord 單則訊息上限 2000，留點邊界
 LOCK_PORT = 27999             # 單一實例鎖
 COMMAND_PREFIX = "!"
-
 
 def setup_logging() -> logging.Logger:
     """日誌：主控台 + 會輪替的 bot.log（避免無限長大）。"""
@@ -232,9 +218,7 @@ def setup_logging() -> logging.Logger:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     return logging.getLogger("bridge")
 
-
 log = setup_logging()
-
 
 def _pretty(template: str, **kwargs) -> str:
     """格式字串容錯：.env 打錯 {變數} 也不會讓事件處理爆掉。"""
@@ -243,11 +227,9 @@ def _pretty(template: str, **kwargs) -> str:
     except (KeyError, IndexError, ValueError):
         return template
 
-
 def _clip(text: str, limit: int = MAX_MESSAGE) -> str:
     text = "" if text is None else str(text)
     return text if len(text) <= limit else text[: limit - 1] + "…"
-
 
 # ============================================================ 2. 文字工具
 COLOR_CODE = re.compile(r"§.")
@@ -267,7 +249,6 @@ PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 
 TP_DOMAIN_RE = re.compile(r"tpmultiplayer\.([a-z0-9]+)", re.IGNORECASE)
 
-
 def is_tp_banner(text: str) -> bool:
     """是不是 TP 外掛自己印的說明文字 / 記憶體噪聲（不是真的有人加入）。"""
     lowered = str(text or "")
@@ -278,7 +259,6 @@ def is_tp_banner(text: str) -> bool:
     if domain and domain.group(1).lower() != "xyz":
         return True
     return False
-
 
 def valid_player_name(name: str) -> bool:
     """合法的基岩版玩家名：3~16 位英數或底線。
@@ -292,7 +272,6 @@ def valid_player_name(name: str) -> bool:
     if "tpmultiplayer" in name.lower():
         return False
     return True
-
 
 def looks_like_player_name(name: str) -> bool:
     """加入 / 離開事件用的寬鬆版（允許含空格的 gamertag）。
@@ -315,7 +294,6 @@ def looks_like_player_name(name: str) -> bool:
         return False
     return 3 <= sum(len(p) for p in parts) <= 16
 
-
 def is_platform_inviter(name: str) -> bool:
     """是不是 miaaoo 官方發邀請的帳號（Happy2026MC / HelloMC25 系列）。
 
@@ -325,15 +303,12 @@ def is_platform_inviter(name: str) -> bool:
     """
     return str(name or "").strip().lower() in PLATFORM_INVITERS
 
-
 # 伺服器 UI 廣播（tellraw 狀態面板之類），不要往 Discord 送
 UI_SPAM_KEYWORDS = ("系統狀態", "掃地倒數", "你的錢包", "VIP等級", "當前人數", "你的名字")
-
 
 def strip_colors(text: str) -> str:
     """移除 §a §l 這類色碼。"""
     return COLOR_CODE.sub("", str(text))
-
 
 def extract_text(raw: str) -> str:
     """把 Minecraft 的 § 色碼與 rawtext JSON 拆成純文字。"""
@@ -351,21 +326,17 @@ def extract_text(raw: str) -> str:
             return parts
     return text
 
-
 def is_ui_spam(text: str) -> bool:
     return any(k in text for k in UI_SPAM_KEYWORDS)
-
 
 def normalize_cmd(raw: str) -> str:
     """`/list` → `list`（玩家常在前面多打一個斜線）。"""
     raw = (raw or "").strip()
     return raw[1:].strip() if raw.startswith("/") else raw
 
-
 def first_token(cmd: str) -> str:
     parts = cmd.split()
     return parts[0].lower() if parts else ""
-
 
 def extract_players(raw: str) -> List[str]:
     """從 `list` 指令的回覆抓玩家名。"""
@@ -377,17 +348,14 @@ def extract_players(raw: str) -> List[str]:
         return []
     return [x.strip() for x in tail.split(",") if x.strip()]
 
-
 # ------------------------------------------------------------------ 狀態列用的格式化
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
 
 def cn_stamp(moment: Optional[datetime] = None) -> str:
     """周六, 07. 11月 2026 14:05:12 CST（照 `%a` 會被系統語系影響，所以自己排）。"""
     t = moment or datetime.now()
     return (f"{_WEEKDAYS[t.weekday()]}, {t.day:02d}. {t.month}月 {t.year} "
             f"{t.strftime('%H:%M:%S')} CST")
-
 
 def humanize_duration(seconds: float) -> str:
     """90 → 1 分鐘；5400 → 1 小時 30 分鐘；200000 → 2 天 7 小時。"""
@@ -403,14 +371,12 @@ def humanize_duration(seconds: float) -> str:
         return f"{minutes} 分鐘"
     return f"{secs} 秒"
 
-
 def parse_list_counts(raw: str) -> Tuple[int, int]:
     """從 `list` 回顯抓 (在線, 上限)，例如 `There are 2/20 players online:`。"""
     match = re.search(r"(\d+)\s*/\s*(\d+)", raw or "")
     if not match:
         return 0, 0
     return int(match.group(1)), int(match.group(2))
-
 
 def game_process_started_at() -> Optional[float]:
     """本機 Minecraft.Windows.exe 的啟動時間（世界運行時長的近似值）。
@@ -472,7 +438,6 @@ def game_process_started_at() -> Optional[float]:
     finally:
         k32.CloseHandle(snapshot)
 
-
 # ============================================================ 3. JSON 檔案存放
 def _atomic_write_json(path: str, data: Any, indent: int = 4):
     """先寫暫存檔再 rename：避免斷電 / 強制關閉把 json 寫成半截。"""
@@ -485,14 +450,12 @@ def _atomic_write_json(path: str, data: Any, indent: int = 4):
         os.fsync(fh.fileno())
     os.replace(tmp, target)
 
-
 def _read_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             return json.load(fh)
     except Exception:
         return default
-
 
 class WhitelistStore:
     """授權使用者（Discord ID 或名稱）。"""
@@ -540,7 +503,6 @@ class WhitelistStore:
         self._data.remove(name)
         self.save()
         return True
-
 
 class BanStore:
     """封禁名單：{名字: {name, reason, until(ms), by}}。
@@ -616,7 +578,6 @@ class BanStore:
             return True
         return False
 
-
 class BridgeConfig:
     """允許的 Discord 伺服器 / 頻道。
 
@@ -656,14 +617,12 @@ class BridgeConfig:
     def allowed_channels(self) -> Set[int]:
         return set(self.channel_ids) | ({self.channel_id} if self.channel_id else set())
 
-
 # ============================================================ 4. WebSocket 伺服器
 @dataclass
 class PendingCommand:
     future: asyncio.Future
     timestamp: float
     acked: bool = False        # 只收到橋接器的「已送出」ACK，還沒等到遊戲回顯
-
 
 class MCWebSocketServer:
     """對外是「Minecraft 事件來源」，對內把事件轉給 handler。"""
@@ -1072,10 +1031,8 @@ class MCWebSocketServer:
                 self._clients.discard(ws)
         return sent > 0
 
-
 # ============================================================ 5. HTTP 封禁 API
 _bg_tasks: Set[asyncio.Task] = set()
-
 
 def _spawn(coro) -> asyncio.Task:
     """背景任務要留引用，否則可能被 GC 回收、例外也看不到。"""
@@ -1084,15 +1041,12 @@ def _spawn(coro) -> asyncio.Task:
     task.add_done_callback(_bg_tasks.discard)
     return task
 
-
 def _api_authorized(request: web.Request) -> bool:
     # header 或瀏覽器友善的 ?key=
     return request.headers.get("x-api-key") == BAN_API_KEY or request.query.get("key") == BAN_API_KEY
 
-
 def _unauthorized() -> web.Response:
     return web.json_response({"error": "無效 API key"}, status=401)
-
 
 async def start_ban_api(bot: "DCListener", store: BanStore) -> web.AppRunner:
     """啟動 Ban API（只綁 127.0.0.1）；回傳 runner，呼叫端負責 cleanup。"""
@@ -1172,7 +1126,6 @@ async def start_ban_api(bot: "DCListener", store: BanStore) -> web.AppRunner:
     log.info(f"✅ Ban API 已啟動 http://127.0.0.1:{BAN_API_PORT} (x-api-key: {BAN_API_KEY})")
     return runner
 
-
 # ============================================================ 6. Miaaoo 聯機大廳 API
 # 依 https://docs.miaaoo.com 的 v2 介面實作（文件版 v2.0.0）：
 #   GET  /v2/list                       房間列表（lang 可重複，如 ?lang=zh&lang=en）
@@ -1200,7 +1153,6 @@ WORLD_TYPE_TEXT = {
     "Survival": "生存", "Creative": "創造", "Spectator": "旁觀",
     "Adventure": "冒險", "Unknown": "未知",
 }
-
 
 @dataclass
 class Room:
@@ -1264,7 +1216,6 @@ class Room:
         lock = "" if self.joinable else "🔒"
         return _clip(f"{lock}{self.world} ｜ {self.host} ｜ {self.players}/{self.max_players}", 95)
 
-
 @dataclass
 class MiaaooResult:
     ok: bool
@@ -1272,7 +1223,6 @@ class MiaaooResult:
     status: int = 0
     code: str = ""
     data: Any = None
-
 
 class MiaaooAPI:
     """聯機大廳 API 封裝。任何失敗都回傳結構化結果，不外拋例外打斷 bot。"""
@@ -1532,136 +1482,10 @@ class MiaaooAPI:
         msg = (data or {}).get("message_zh_CN") if isinstance(data, dict) else ""
         return status, msg or f"HTTP {status}"
 
-
-# ============================================================ 6.5 acz 玩家紀錄 API
-class AczAPI:
-    """https://acz.cc.cd 的玩家違規紀錄 API（Bearer Token）。
-
-    端點（見 /docs）：
-        GET  /list            查詢所有違規紀錄
-        POST /upload          上傳玩家紀錄 {playerName, reason}
-        POST /auth/login      {username, password} → 臨時 Token + 永久 Token
-
-    沒有填 `ACZ_TOKEN` 時整個功能自動停用，不影響其他功能。
-    `/list` 的實際欄位規格沒有寫在 openapi 裡，所以這裡做容錯解析。
-    """
-
-    CACHE_TTL = 180.0          # 紀錄快取 3 分鐘（別每次有人加入就打一次）
-
-    def __init__(self):
-        self.base = ACZ_API_BASE
-        self.token = ACZ_TOKEN
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._records: List[Dict[str, Any]] = []
-        self._at: float = 0.0
-        self.note = ""          # 最近一次失敗原因，給指令顯示
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.token)
-
-    async def start(self):
-        if self._session is None or self._session.closed:
-            headers = {"User-Agent": f"mc-bridge {__version__}", "Accept": "application/json"}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=12, connect=6), headers=headers)
-        return self._session
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-    async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[int, Any]:
-        await self.start()
-        try:
-            async with self._session.request(method, self.base + path, json=payload) as resp:
-                status = resp.status
-                text = await resp.text()
-        except asyncio.TimeoutError:
-            return 0, {"message": "請求逾時"}
-        except aiohttp.ClientError as exc:
-            return 0, {"message": f"連線失敗：{exc}"}
-        try:
-            return status, json.loads(text)
-        except ValueError:
-            return status, {"message": f"HTTP {status} 非 JSON：{text[:160]}"}
-
-    # ------------------------------------------------ 查詢
-    async def records(self, force: bool = False) -> List[Dict[str, Any]]:
-        if not self.enabled:
-            self.note = "未設定 ACZ_TOKEN"
-            return []
-        now = time.monotonic()
-        if not force and self._records and now - self._at < self.CACHE_TTL:
-            self.note = ""
-            return self._records
-
-        status, data = await self._request("GET", "/list")
-        if status == 200:
-            items: List[Dict[str, Any]] = []
-            if isinstance(data, list):
-                items = [x for x in data if isinstance(x, dict)]
-            elif isinstance(data, dict):
-                for key in ("records", "data", "items", "list"):
-                    if isinstance(data.get(key), list):
-                        items = [x for x in data[key] if isinstance(x, dict)]
-                        break
-            self._records = items
-            self._at = now
-            self.note = ""
-            return items
-
-        self.note = f"HTTP {status}：{(data or {}).get('message', '') if isinstance(data, dict) else ''}".strip()
-        log.warning(f"acz /list 失敗: {self.note}")
-        return self._records          # 失敗時退回上次的結果
-
-    @staticmethod
-    def name_of(rec: Dict[str, Any]) -> str:
-        for key in ("playerName", "player", "name", "gamertag", "username"):
-            value = rec.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return ""
-
-    @staticmethod
-    def reason_of(rec: Dict[str, Any]) -> str:
-        for key in ("reason", "detail", "note", "description"):
-            value = rec.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return "（未提供原因）"
-
-    def find(self, player: str) -> List[Dict[str, Any]]:
-        """在快取裡找這個玩家的紀錄（名字不分大小寫）。"""
-        key = str(player or "").strip().lower()
-        if not key:
-            return []
-        return [r for r in self._records if self.name_of(r).lower() == key]
-
-    # ------------------------------------------------ 上報
-    async def upload(self, player: str, reason: str) -> Tuple[bool, str]:
-        if not self.enabled:
-            return False, "未設定 ACZ_TOKEN，略過上報"
-        status, data = await self._request(
-            "POST", "/upload", {"playerName": player, "reason": reason})
-        message = ""
-        if isinstance(data, dict):
-            message = str(data.get("message") or data.get("error") or data.get("raw") or "")
-        ok = 200 <= status < 300
-        if ok:
-            self._at = 0.0        # 下次查詢會重新拉
-            return True, message or "已上報"
-        return False, message or f"HTTP {status}"
-
-
 # ============================================================ 7. Discord 客戶端
 def is_admin(message: discord.Message) -> bool:
     perms = getattr(message.author, "guild_permissions", None)
     return bool(perms and getattr(perms, "administrator", False))
-
 
 @dataclass
 class DeferredCmd:
@@ -1670,7 +1494,6 @@ class DeferredCmd:
     label: str
     created: float
     player: str = ""        # 踢人指令才有：補送前先確認這人還在線上
-
 
 class RoomPaginator(discord.ui.View):
     """房間列表分頁。每頁 6 間，避免整串超過 embed 上限。"""
@@ -1747,7 +1570,6 @@ class RoomPaginator(discord.ui.View):
             self.page = 0
             self._refresh_buttons()
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
-
 
 class StatusBoard:
     """一條會自己刷新的伺服器狀態列（一行式）。
@@ -1937,7 +1759,6 @@ class StatusBoard:
         except Exception as exc:
             log.warning(f"接續狀態列失敗: {exc}")
 
-
 class DCListener(discord.Client):
     """Discord 端：把遊戲事件送到頻道，並提供管理指令。"""
 
@@ -1972,7 +1793,6 @@ class DCListener(discord.Client):
         self._board_started = False                # 狀態列只接續一次（on_ready 可能重複觸發）
         self._seen_players: Set[str] = set()       # 本次執行以來加入過的人（狀態列的「已加入」）
         self.board = StatusBoard(self)             # 一行式狀態列
-        self.acz_api = AczAPI()                        # acz.cc.cd 玩家紀錄（沒 token 就自動停用）
         self._shutdown_requested = False           # 使用者主動要求下線（會清指令 + 不重啟）
         self._closing = False                      # close() 進來過就別再進來
         self._handlers: Dict[str, Callable] = {
@@ -2010,7 +1830,7 @@ class DCListener(discord.Client):
                     self.slash_kick, self.slash_ban, self.slash_unban, self.slash_banned,
                     self.slash_settings, self.slash_sync, self.slash_wl,
                     self.slash_shutdown,
-                    self.slash_join, self.lianji, self.statusboard, self.acz):
+                    self.slash_join, self.lianji, self.statusboard):
             self.tree.add_command(cmd)
 
         self._bind_commands()
@@ -2124,11 +1944,6 @@ class DCListener(discord.Client):
             await self.board.stop(delete_message=False)
         except Exception as exc:
             log.warning(f"停止狀態列失敗: {exc}")
-
-        try:
-            await self.acz_api.close()
-        except Exception:
-            pass
 
         if self._deferred_task and not self._deferred_task.done():
             self._deferred_task.cancel()
@@ -2413,26 +2228,6 @@ class DCListener(discord.Client):
             lines.append("（單向模式：未執行 kick）")
         await self._send_to_discord("防禦系統", "\n".join(lines))
 
-    async def _check_acz(self, player: str):
-        """查 acz.cc.cd 的違規紀錄；命中就發到「防禦系統」頻道（只提示，不踢）。"""
-        try:
-            if not self.acz_api._records:
-                await self.acz_api.records()
-            hits = self.acz_api.find(player)
-        except Exception as exc:
-            log.debug(f"acz 查詢失敗: {exc}")
-            return
-        if not hits:
-            return
-
-        log.warning(f"🔎 acz 有 {player} 的 {len(hits)} 筆紀錄")
-        lines = [f"玩家: **{player}**", f"共 **{len(hits)}** 筆紀錄"]
-        for rec in hits[:5]:
-            lines.append(f"· {_clip(self.acz_api.reason_of(rec), 200)}")
-        if self.blacklist.get(player):
-            lines.append("（本地封禁名單也有他）")
-        await self._send_to_discord("防禦系統", "🔎 **acz 違規紀錄命中**\n" + "\n".join(lines))
-
     async def _announce_tp(self, player: str) -> None:
         """把「玩家嘗試加入」打在遊戲公屏上（讓遊戲裡的人也看得到）。"""
         text = TP_ANNOUNCE_TEXT.replace("{player}", player)
@@ -2495,10 +2290,6 @@ class DCListener(discord.Client):
         if is_platform_inviter(player):
             log.info(f"ℹ️ {player} 是 miaaoo 邀請帳號，不做封禁處理")
             return
-
-        # 順手查 acz 的違規紀錄（只提示，不會自動踢）
-        if ACZ_CHECK_ON_JOIN and self.acz_api.enabled:
-            _spawn(self._check_acz(player))
 
         self.blacklist.load()
         rec = self.blacklist.get(player)
@@ -2839,14 +2630,6 @@ class DCListener(discord.Client):
         embed.add_field(name="操作人", value=str(interaction.user), inline=True)
         embed.add_field(name="結果", value=_clip(result, 1000), inline=False)
 
-        # 順便上報到 acz（預設關閉；要開請在 .env 設 ACZ_UPLOAD_ON_BAN=true）
-        if ACZ_UPLOAD_ON_BAN and self.acz_api.enabled:
-            ok, message = await self.acz_api.upload(player, rec["reason"])
-            embed.add_field(
-                name="acz 上報",
-                value=("✅ " if ok else "⚠️ ") + _clip(message, 300),
-                inline=False)
-
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="unban", description="解除封禁")
@@ -2885,69 +2668,6 @@ class DCListener(discord.Client):
         if len(items) > 20:
             embed.set_footer(text=f"只顯示前 20 筆，共 {len(items)} 筆")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ------------------------------------------------ 斜線指令：acz 紀錄
-    acz = app_commands.Group(name="acz", description="acz.cc.cd 玩家違規紀錄")
-
-    @acz.command(name="check", description="查某個玩家在 acz 的違規紀錄")
-    @app_commands.describe(player="玩家名")
-    @app_commands.autocomplete(player=player_autocomplete)
-    async def acz_check(self, interaction: discord.Interaction, player: str):
-        if not self._may_manage(interaction):
-            return await self._deny(interaction)
-        if not self.acz_api.enabled:
-            return await self._deny(interaction, "❌ 未設定 `ACZ_TOKEN`（在 .env 填入永久 Token）")
-
-        await interaction.response.defer(thinking=True)
-        await self.acz_api.records()
-        hits = self.acz_api.find(player)
-        if not hits:
-            await self.acz_api.records(force=True)
-            hits = self.acz_api.find(player)
-
-        embed = discord.Embed(
-            title=f"🔎 {player} — {len(hits)} 筆紀錄" if hits else f"✅ {player} 沒有紀錄",
-            color=0xEF4444 if hits else 0x22C55E,
-        )
-        if hits:
-            embed.description = _clip(
-                "\n".join(f"· {self.acz_api.reason_of(rec)}" for rec in hits[:10]), 3500)
-        else:
-            detail = f"共 {len(self.acz_api._records)} 筆紀錄裡沒有他"
-            if self.acz_api.note:
-                detail += f"\n⚠️ {self.acz_api.note}"
-            embed.description = detail
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @acz.command(name="sync", description="重新拉取 acz 紀錄快取")
-    async def acz_sync(self, interaction: discord.Interaction):
-        if not self._may_manage(interaction):
-            return await self._deny(interaction)
-        if not self.acz_api.enabled:
-            return await self._deny(interaction, "❌ 未設定 `ACZ_TOKEN`")
-
-        await interaction.response.defer(ephemeral=True)
-        records = await self.acz_api.records(force=True)
-        text = f"✅ 已更新：共 {len(records)} 筆紀錄"
-        if self.acz_api.note:
-            text = f"⚠️ 拉取失敗：{self.acz_api.note}\n（目前顯示上次的 {len(records)} 筆）"
-        await interaction.followup.send(text, ephemeral=True)
-
-    @acz.command(name="upload", description="上報一個違規紀錄到 acz")
-    @app_commands.describe(player="玩家名", reason="原因（勿填真實姓名等隱私）")
-    @app_commands.autocomplete(player=player_autocomplete)
-    async def acz_upload(self, interaction: discord.Interaction, player: str, reason: str):
-        if not self._may_manage(interaction):
-            return await self._deny(interaction)
-        if not self.acz_api.enabled:
-            return await self._deny(interaction, "❌ 未設定 `ACZ_TOKEN`")
-
-        await interaction.response.defer(ephemeral=True)
-        ok, message = await self.acz_api.upload(player, reason)
-        prefix = "✅ 已上報" if ok else "❌ 上報失敗"
-        await interaction.followup.send(
-            f"{prefix}\n玩家: **{player}**\n原因: {_clip(reason, 300)}\n結果: `{_clip(message, 300)}`",
-            ephemeral=True)
 
     # ------------------------------------------------ 斜線指令：狀態列
     statusboard = app_commands.Group(name="statusboard", description="伺服器狀態列（一行式，自動刷新）")
@@ -3493,7 +3213,6 @@ class DCListener(discord.Client):
         else:
             await message.reply("❌ 未知子指令，可用：`add` / `del` / `list`")
 
-
 # ============================================================ 8. 組裝與進入點
 def _wire(mc: MCWebSocketServer, bot: DCListener):
     mc.on_chat = bot.on_mc_chat
@@ -3506,7 +3225,6 @@ def _wire(mc: MCWebSocketServer, bot: DCListener):
     mc.on_kick_result = bot.on_kick_result
     mc.on_connected = bot.on_bridge_connected
     mc.on_disconnected = bot.on_bridge_disconnected
-
 
 async def _run():
     if not DISCORD_TOKEN:
@@ -3611,12 +3329,10 @@ async def _run():
                 except (ValueError, OSError):
                     pass
 
-
 def _port_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.3)
         return sock.connect_ex(("127.0.0.1", port)) == 0
-
 
 def _cli_stop() -> None:
     """`python bot.py --stop`：請正在跑的實例優雅關閉（含移除斜線指令）。"""
@@ -3640,7 +3356,6 @@ def _cli_stop() -> None:
             return
     print("[stop] ⚠️ bot 還在關閉中，稍等一下（或直接關掉視窗）")
 
-
 def _acquire_single_instance() -> Optional[socket.socket]:
     """用一個本機 port 當鎖，避免同時跑兩份（會互搶 Discord 連線）。"""
     lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3652,7 +3367,6 @@ def _acquire_single_instance() -> Optional[socket.socket]:
         print(f"另一個 bot.py 已在執行（port {LOCK_PORT} 被占用），本實例結束。")
         return None
     return lock
-
 
 def main():
     for stream in (sys.stdout, sys.stderr):
@@ -3686,7 +3400,6 @@ def main():
         raise
     finally:
         lock.close()
-
 
 if __name__ == "__main__":
     main()
